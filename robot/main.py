@@ -1,5 +1,4 @@
 import socket
-import uuid
 import time
 import json
 import threading
@@ -31,9 +30,10 @@ sender_ip = get_local_ip()
 device_id = f"ROBOT_{sender_ip.replace('.', '')}"
 
 def broadcast_join(reply_tcp_port: int = TCP_ACK_PORT) -> None:
+	timestamp = time.time()
 	payload = {
-		"message_id": str(uuid.uuid4()),
-		"timestamp": int(time.time()),
+		"message_id": f"{int(timestamp * 1000000)}",
+		"timestamp": int(timestamp),
 		"message_type": "CONNECTION_REQUEST",
 		"device_id": device_id,
 		"device_type": "robot",
@@ -145,9 +145,10 @@ def send_heartbeat(base_station_ip: str, stop_event: threading.Event | None = No
 				logging.info("Heartbeat stopped")
 				return
 
+			timestamp = time.time()
 			payload = {
-				"message_id": str(uuid.uuid4()),
-				"timestamp": int(time.time()),
+				"message_id": f"{int(timestamp * 1000000)}",
+				"timestamp": int(timestamp),
 				"message_type": "HEARTBEAT",
 				"receiver_category": "BASE_STATION",
 				"battery_health": get_battery_health(),

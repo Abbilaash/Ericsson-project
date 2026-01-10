@@ -6,7 +6,7 @@ import math
 # USER INPUTS
 # --------------------------------------------------
 CONNECTION = "COM11"     # or /dev/ttyACM0
-BAUD = 57600
+BAUD = 9600
 
 CENTER_X = 0.0           # meters (forward)
 CENTER_Y = 0.0           # meters (right)

@@ -22,19 +22,3 @@ def detect_yellow(frame, min_area=500):
 
     return detected, frame
 
-cap = cv2.VideoCapture(1)
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    found, output = detect_yellow(frame)
-    if found:
-        print("Yellow detected")
-    cv2.imshow("Yellow Detection", output)
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
-

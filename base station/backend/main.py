@@ -5,6 +5,8 @@ import time
 from flask import Flask, jsonify, request
 import flask_cors
 
+# NOTE: FORWARD_ALL, FORWARD_TO
+
 
 def get_base_station_ip():
     try:
@@ -201,17 +203,24 @@ def udp_listener():
                         "device_type": device_type,
                         "updated_at": time.time()
                     }
-                elif message_type == "HEARTBEAT" and device_id:
-                    if device_id in devices:
-                        devices[device_id]["updated_at"] = time.time()
-                        devices[device_id]["battery_health"] = msg.get('battery_health', 100)
-                        print(f"[UDP] Updated {device_id} heartbeat (battery: {msg.get('battery_health', 'N/A')}%)")
+                elif message_type == "HEARTBEAT":
+                    # Update device based on sender_ip since heartbeat may not include device_id
+                    updated = False
+                    for dev_id, dev in devices.items():
+                        if dev.get("ip") == device_ip:
+                            dev["updated_at"] = time.time()
+                            dev["battery_health"] = msg.get('battery_health', 100)
+                            print(f"[UDP] Updated {dev_id} heartbeat (battery: {msg.get('battery_health', 'N/A')}%)")
+                            updated = True
+                            break
+                    
+                    if updated:
                         log_packet(
                             direction="in",
                             transport="UDP",
                             packet_type="STATUS",
                             message_type="HEARTBEAT",
-                            sender_id=device_id,
+                            sender_id=device_id or device_ip,
                             receiver_id="base_station",
                             payload=msg,
                         )
@@ -221,6 +230,124 @@ def udp_listener():
     
     except Exception as e:
         print(f"[UDP] Listener error: {e}")
+
+def forward_to_all(receiver_category: str, message_content: dict):
+    sent_to = []
+    timestamp = time.time()
+    
+    for dev_id, dev in devices.items():
+        device_category = dev.get("device_type", "unknown").lower()
+        
+        if device_category == receiver_category:
+            device_ip = dev.get("ip")
+            if device_ip:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
+                        tcp.settimeout(2)
+                        tcp.connect((device_ip, TCP_PORT))
+                        
+                        forward_msg = {
+                            "message_id": f"{int(timestamp * 1000000)}",
+                            "timestamp": int(timestamp),
+                            "message_type": "FORWARD_ALL",
+                            "receiver_category": receiver_category,
+                            "sender": "base_station",
+                            "content": message_content
+                        }
+                        tcp.sendall(json.dumps(forward_msg).encode('utf-8'))
+                        sent_to.append(dev_id)
+                        print(f"[FORWARD] Sent FORWARD_ALL to {dev_id} at {device_ip}")
+                        log_packet(
+                            direction="out",
+                            transport="TCP",
+                            packet_type="FORWARD",
+                            message_type="FORWARD_ALL",
+                            sender_id="base_station",
+                            receiver_id=dev_id,
+                            payload=forward_msg,
+                        )
+                except Exception as e:
+                    print(f"[FORWARD] Failed to send to {dev_id}: {e}")
+    
+    return sent_to
+
+
+def forward_to_device(receiver_id: str, receiver_ip: str, message_content: dict):
+    timestamp = time.time()
+    message_id = f"{int(timestamp * 1000000)}"
+    
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
+            tcp.settimeout(2)
+            tcp.connect((receiver_ip, TCP_PORT))
+            
+            forward_msg = {
+                "message_id": message_id,
+                "timestamp": int(timestamp),
+                "message_type": "FORWARD_TO",
+                "receiver_id": receiver_id,
+                "sender": "base_station",
+                "content": message_content
+            }
+            tcp.sendall(json.dumps(forward_msg).encode('utf-8'))
+            print(f"[FORWARD] Sent FORWARD_TO message to {receiver_id} at {receiver_ip}")
+            log_packet(
+                direction="out",
+                transport="TCP",
+                packet_type="FORWARD",
+                message_type="FORWARD_TO",
+                sender_id="base_station",
+                receiver_id=receiver_id,
+                payload=forward_msg,
+            )
+            
+            # Update the robot's task_id to the message_id
+            for dev_id, dev in devices.items():
+                if dev_id == receiver_id or dev.get("ip") == receiver_ip:
+                    dev["task_id"] = message_id
+                    print(f"[FORWARD] Updated {dev_id} task_id to {message_id}")
+                    break
+            
+            return True, message_id
+    except Exception as e:
+        print(f"[FORWARD] Failed to send to {receiver_id} at {receiver_ip}: {e}")
+        return False, None
+
+
+def find_available_robot():
+    """
+    Find a robot that is not assigned to any task
+    Returns: (robot_id, robot_ip) or (None, None) if no available robot
+    """
+    for dev_id, dev in devices.items():
+        device_type = dev.get("device_type", "").lower()
+        if device_type == "robot":
+            # Check if robot doesn't have a task_id or task_id is None/empty
+            task_id = dev.get("task_id")
+            if not task_id:
+                return dev_id, dev.get("ip")
+    
+    return None, None
+
+
+def cleanup_stale_devices():
+    while True:
+        try:
+            time.sleep(10)
+            current_time = time.time()
+            devices_to_remove = []
+            
+            for dev_id, dev in devices.items():
+                last_seen = dev.get("updated_at", 0)
+                if current_time - last_seen > 60:
+                    devices_to_remove.append(dev_id)
+            
+            for dev_id in devices_to_remove:
+                del devices[dev_id]
+                print(f"[CLEANUP] Removed {dev_id} due to heartbeat timeout")
+        
+        except Exception as e:
+            print(f"[CLEANUP] Error: {e}")
 
 @app.route("/api/connections")
 def api_connections():
@@ -285,6 +412,77 @@ def api_clear_logs():
     return jsonify({"success": True, "message": "logs cleared"})
 
 
+@app.route("/api/send-broadcast", methods=["POST"])
+def api_send_broadcast():
+    """
+    Send a message to all devices in a specific category
+    Request body: {
+        "receiver_category": "robots" or "drones",
+        "message": {...}
+    }
+    """
+    data = request.get_json()
+    receiver_category = data.get("receiver_category", "").lower()
+    message_content = data.get("message", {})
+    
+    if not receiver_category:
+        return jsonify({"success": False, "error": "receiver_category required"}), 400
+    
+    sent_to = forward_to_all(receiver_category, message_content)
+    
+    return jsonify({
+        "success": True,
+        "sent_to": sent_to,
+        "count": len(sent_to),
+        "message": f"Broadcast sent to {len(sent_to)} {receiver_category}"
+    })
+
+
+@app.route("/api/send-message", methods=["POST"])
+def api_send_message():
+    """
+    Send a message to an available robot (not assigned to any task)
+    Request body: {
+        "message": {...}
+    }
+    OR if specifying a particular device:
+    {
+        "receiver_id": "ROBOT_172_27_240_63",
+        "message": {...}
+    }
+    """
+    data = request.get_json()
+    receiver_id = data.get("receiver_id")
+    message_content = data.get("message", {})
+    
+    # If no specific receiver, find an available robot
+    if not receiver_id:
+        receiver_id, receiver_ip = find_available_robot()
+        if not receiver_id:
+            return jsonify({"success": False, "error": "No available robot (all robots are assigned)"}), 404
+    else:
+        # Find device by ID
+        device = None
+        for dev_id, dev in devices.items():
+            if dev_id == receiver_id or dev.get("ip") == receiver_id:
+                device = dev
+                break
+        
+        if not device:
+            return jsonify({"success": False, "error": f"Device {receiver_id} not found"}), 404
+        
+        receiver_ip = device.get("ip")
+    
+    success, message_id = forward_to_device(receiver_id, receiver_ip, message_content)
+    
+    return jsonify({
+        "success": success,
+        "receiver_id": receiver_id,
+        "message_id": message_id,
+        "message": "Message sent and task assigned" if success else "Failed to send message"
+    })
+
+
 if __name__ == "__main__":
     print(f"\n[SERVER] Starting Network Server")
     print(f"[SERVER] TCP Port: {TCP_PORT}")
@@ -292,5 +490,6 @@ if __name__ == "__main__":
     
     threading.Thread(target=tcp_server, daemon=True).start()
     threading.Thread(target=udp_listener, daemon=True).start()
+    threading.Thread(target=cleanup_stale_devices, daemon=True).start()
     
     app.run(host="0.0.0.0", port=5000, debug=False)

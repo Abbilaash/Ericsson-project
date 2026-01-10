@@ -106,27 +106,59 @@ def tcp_server():
 
 
 def handle_tcp_client(client_sock, client_ip):
+    """Handle persistent TCP connection from drone/robot (newline-delimited JSON)"""
+    # Set timeout so recv() doesn't block forever
+    client_sock.settimeout(120)  # 2 minute timeout for detecting dead connections
+    
     try:
+        buffer = ""
         while True:
-            data = client_sock.recv(BUFFER_SIZE)
-            if not data:
-                break
             try:
-                msg = json.loads(data.decode('utf-8'))
-                print(f"[TCP] Received from {client_ip}: {msg.get('message_type', 'UNKNOWN')}")
-                log_packet(
-                    direction="in",
-                    transport="TCP",
-                    packet_type="MESSAGE",
-                    message_type=msg.get('message_type', 'UNKNOWN'),
-                    sender_id=msg.get('sender_id') or client_ip,
-                    receiver_id="base_station",
-                    payload=msg,
-                )
-            except:
-                pass
+                # Receive data with timeout
+                data = client_sock.recv(BUFFER_SIZE)
+                
+                # Empty data means the remote closed the connection
+                if not data:
+                    print(f"[TCP] Client {client_ip} closed connection")
+                    break
+                
+                # Decode and add to buffer
+                buffer += data.decode('utf-8', errors='ignore')
+                
+                # Process complete messages (separated by newlines)
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    line = line.strip()
+                    
+                    if not line:
+                        continue
+                    
+                    try:
+                        msg = json.loads(line)
+                        print(f"[TCP] Received from {client_ip}: {msg.get('message_type', 'UNKNOWN')}")
+                        log_packet(
+                            direction="in",
+                            transport="TCP",
+                            packet_type="MESSAGE",
+                            message_type=msg.get('message_type', 'UNKNOWN'),
+                            sender_id=msg.get('sender_id') or client_ip,
+                            receiver_id="base_station",
+                            payload=msg,
+                        )
+                    except json.JSONDecodeError as e:
+                        print(f"[TCP] Failed to parse JSON from {client_ip}: {e}")
+                    
+            except socket.timeout:
+                # Timeout waiting for data is normal for idle connections
+                # Just continue waiting for more data
+                continue
+            except Exception as e:
+                print(f"[TCP] Error receiving from {client_ip}: {e}")
+                break
+    
     except Exception as e:
         print(f"[TCP] Error handling client {client_ip}: {e}")
+    
     finally:
         client_sock.close()
         with clients_lock:

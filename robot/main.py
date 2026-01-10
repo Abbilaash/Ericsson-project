@@ -170,7 +170,7 @@ def send_heartbeat(base_station_ip: str, stop_event: threading.Event | None = No
 
 def send_message_to_base_station(base_station_ip: str, message_type: str, content: dict):
 	"""
-	Send a message to the base station via persistent TCP connection
+	Send a message to the base station via persistent TCP connection (newline-delimited JSON)
 	"""
 	global message_sender_socket
 	
@@ -199,7 +199,9 @@ def send_message_to_base_station(base_station_ip: str, message_type: str, conten
 					return False
 			
 			try:
-				message_sender_socket.sendall(json.dumps(msg).encode('utf-8'))
+				# Send JSON message with newline delimiter
+				message_data = json.dumps(msg).encode('utf-8') + b'\n'
+				message_sender_socket.sendall(message_data)
 				logging.info(f"[SEND] Sent {message_type} message to base station")
 				return True
 			except Exception as e:

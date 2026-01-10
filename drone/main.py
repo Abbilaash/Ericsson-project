@@ -263,12 +263,32 @@ def receive_messages(stop_event: threading.Event) -> None:
 
 def start_video_detection(stop_event: threading.Event, base_station_ip: str = None) -> None:
 	try:
-		cap = cv2.VideoCapture(camera_ind)
-		time.sleep(2)
+		# Force GStreamer backend priority
+		os.environ["OPENCV_VIDEOIO_PRIORITY_BACKEND"] = "GSTREAMER"
+		
+		# Pipeline optimized for Pi 5
+		pipeline = (
+			"libcamerasrc ! "
+			"video/x-raw, width=640, height=480 ! "
+			"videoconvert ! "
+			"appsink"
+		)
+		
+		logging.info("[VIDEO] Attempting to open camera with GStreamer...")
+		cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+		
 		if not cap.isOpened():
-			logging.error("[VIDEO] Failed to open camera")
+			logging.warning("[VIDEO] GStreamer failed. Attempting direct V4L2...")
+			cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+		
+		if not cap.isOpened():
+			logging.error("[VIDEO] CRITICAL: All camera backends failed")
 			return
+		
 		logging.info("[VIDEO] Camera opened successfully")
+		time.sleep(2)  # Wait for camera to stabilize
+		logging.info("[VIDEO] Camera initialized, starting detection")
+		
 		while not stop_event.is_set():
 			ret, frame = cap.read()
 			if not ret:

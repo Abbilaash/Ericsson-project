@@ -11,7 +11,7 @@ from utils import detect_yellow
 UDP_SERVER_PORT = 8888 
 TCP_ACK_PORT = 9999   
 HEARTBEAT_INTERVAL_SEC = 60
-camera_ind = 0
+camera_ind = '/dev/video0'
 
 ISSUE_TABLE = {
 	"yellow":"robots"
@@ -263,8 +263,7 @@ def receive_messages(stop_event: threading.Event) -> None:
 
 def start_video_detection(stop_event: threading.Event, base_station_ip: str = None) -> None:
 	try:
-		cap = cv2.VideoCapture("libcamerasrc ! video/x-raw,width=640,height=480 ! videoconvert ! appsink",
-						 cv2.CAP_GSTREAMER)
+		cap = cv2.VideoCapture(camera_ind,cv2.CAP_GSTREAMER)
 		time.sleep(2)
 		if not cap.isOpened():
 			logging.error("[VIDEO] Failed to open camera")

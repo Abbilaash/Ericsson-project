@@ -260,16 +260,11 @@ def receive_messages(stop_event: threading.Event) -> None:
 	except Exception as e:
 		logging.error(f"[MESSAGE] Error in receive_messages: {e}")
 
-def gstreamer_pipeline(width=640, height=480, fps=30):
-    return (
-        f"libcamerasrc ! video/x-raw, width={width}, height={height}, framerate={fps}/1 ! "
-        "videoconvert ! videoscale ! video/x-raw, format=BGR ! appsink"
-    )
 
 def start_video_detection(stop_event: threading.Event, base_station_ip: str = None) -> None:
 	try:
-		#cap = cv2.VideoCapture(camera_ind)
-		cap = cv2.VideoCapture(gstreamer_pipeline(), cv2.CAP_GSTREAMER)
+		pipeline = "libcamerasrc ! video/x-raw, width=640, height=480 ! videoconvert ! appsink"
+		cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
 		time.sleep(2)
 		if not cap.isOpened():
 			logging.error("[VIDEO] Failed to open camera")

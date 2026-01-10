@@ -22,3 +22,4 @@ def detect_yellow(frame, min_area=500):
 
     return detected, frame
 
+

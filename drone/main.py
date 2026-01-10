@@ -37,6 +37,10 @@ def get_local_ip() -> str:
 sender_ip = get_local_ip()
 device_id = f"DRONE_{sender_ip.replace('.', '')}"
 
+# Persistent connection to base station for sending messages
+message_sender_socket = None
+message_sender_lock = threading.Lock()
+
 def broadcast_join(reply_tcp_port: int = TCP_ACK_PORT) -> None:
 	timestamp = time.time()
 	payload = {
@@ -161,8 +165,10 @@ def send_heartbeat(base_station_ip: str, stop_event: threading.Event | None = No
 
 def send_message_to_base_station(base_station_ip: str, message_type: str, content: dict):
 	"""
-	Send a message to the base station via TCP
+	Send a message to the base station via persistent TCP connection
 	"""
+	global message_sender_socket
+	
 	try:
 		timestamp = time.time()
 		msg = {
@@ -174,14 +180,30 @@ def send_message_to_base_station(base_station_ip: str, message_type: str, conten
 			"content": content
 		}
 		
-		with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
-			tcp.settimeout(2)
-			tcp.connect((base_station_ip, 9999))
-			tcp.sendall(json.dumps(msg).encode('utf-8'))
-			logging.info(f"[SEND] Sent {message_type} message to base station at {base_station_ip}")
-			return True
+		with message_sender_lock:
+			# If no connection exists or it's broken, create a new one
+			if message_sender_socket is None:
+				try:
+					message_sender_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+					message_sender_socket.settimeout(5)
+					message_sender_socket.connect((base_station_ip, 9999))
+					logging.info(f"[SEND] Established persistent connection to base station at {base_station_ip}")
+				except Exception as e:
+					logging.error(f"[SEND] Failed to establish connection: {e}")
+					message_sender_socket = None
+					return False
+			
+			try:
+				message_sender_socket.sendall(json.dumps(msg).encode('utf-8'))
+				logging.info(f"[SEND] Sent {message_type} message to base station")
+				return True
+			except Exception as e:
+				logging.error(f"[SEND] Failed to send message: {e}")
+				message_sender_socket = None
+				return False
+	
 	except Exception as e:
-		logging.error(f"[SEND] Failed to send message to base station: {e}")
+		logging.error(f"[SEND] Error in send_message_to_base_station: {e}")
 		return False
 
 
@@ -316,6 +338,19 @@ def start_video_detection(stop_event: threading.Event, base_station_ip: str = No
 				pass
 
 
+def cleanup_connections():
+	"""Close persistent connections on shutdown"""
+	global message_sender_socket
+	with message_sender_lock:
+		if message_sender_socket:
+			try:
+				message_sender_socket.close()
+				logging.info("[CLEANUP] Closed persistent connection to base station")
+			except:
+				pass
+			message_sender_socket = None
+
+
 def main():
 	broadcast_join(reply_tcp_port=TCP_ACK_PORT)
 	base_ip = wait_for_tcp_ack(listen_port=TCP_ACK_PORT, timeout_sec=120)
@@ -344,6 +379,7 @@ def main():
 	except KeyboardInterrupt:
 		logging.info("Shutting down...")
 		stop_event.set()
+		cleanup_connections()
 		hb_thread.join(timeout=5)
 		video_thread.join(timeout=5)
 		msg_thread.join(timeout=5)

@@ -263,8 +263,7 @@ def receive_messages(stop_event: threading.Event) -> None:
 
 def start_video_detection(stop_event: threading.Event, base_station_ip: str = None) -> None:
 	try:
-		pipeline = "libcamerasrc ! video/x-raw, width=640, height=480 ! videoconvert ! appsink"
-		cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+		cap = cv2.VideoCapture(camera_ind)
 		time.sleep(2)
 		if not cap.isOpened():
 			logging.error("[VIDEO] Failed to open camera")

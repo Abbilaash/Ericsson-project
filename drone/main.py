@@ -4,14 +4,16 @@ import json
 import threading
 import logging
 import os
-import cv2
-from utils import detect_yellow
+import numpy as np
+from picamera2 import Picamera2
 
 
 UDP_SERVER_PORT = 8888 
 TCP_ACK_PORT = 9999   
 HEARTBEAT_INTERVAL_SEC = 60
-camera_ind = '/dev/video0'
+
+# Yellow detection threshold
+YELLOW_PIXEL_THRESHOLD = 500
 
 ISSUE_TABLE = {
 	"yellow":"robots"
@@ -262,50 +264,56 @@ def receive_messages(stop_event: threading.Event) -> None:
 
 
 def start_video_detection(stop_event: threading.Event, base_station_ip: str = None) -> None:
+	"""Detect yellow color using PiCamera2"""
+	picam2 = None
 	try:
-		# Force GStreamer backend priority
-		os.environ["OPENCV_VIDEOIO_PRIORITY_BACKEND"] = "GSTREAMER"
+		# Setup the Camera
+		logging.info("[VIDEO] Initializing PiCamera2...")
+		picam2 = Picamera2()
+		config = picam2.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
+		picam2.configure(config)
+		picam2.start()
 		
-		# Pipeline optimized for Pi 5
-		pipeline = (
-			"libcamerasrc ! "
-			"video/x-raw, width=640, height=480 ! "
-			"videoconvert ! "
-			"appsink"
-		)
-		
-		logging.info("[VIDEO] Attempting to open camera with GStreamer...")
-		cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-		
-		if not cap.isOpened():
-			logging.warning("[VIDEO] GStreamer failed. Attempting direct V4L2...")
-			cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-		
-		if not cap.isOpened():
-			logging.error("[VIDEO] CRITICAL: All camera backends failed")
-			return
-		
-		logging.info("[VIDEO] Camera opened successfully")
-		time.sleep(2)  # Wait for camera to stabilize
+		# Wait for camera to stabilize
+		time.sleep(2)
 		logging.info("[VIDEO] Camera initialized, starting detection")
 		
+		# Define Yellow Range (RGB)
+		lower_yellow = np.array([150, 150, 0])   # R > 150, G > 150, B < 100
+		upper_yellow = np.array([255, 255, 100])
+		
 		while not stop_event.is_set():
-			ret, frame = cap.read()
-			if not ret:
-				logging.error("[VIDEO] Failed to capture frame")
+			try:
+				# Capture frame as NumPy array
+				frame = picam2.capture_array()
+				
+				# Create mask for yellow pixels
+				mask = np.all((frame >= lower_yellow) & (frame <= upper_yellow), axis=-1)
+				
+				# Count yellow pixels
+				yellow_count = np.sum(mask)
+				
+				if yellow_count > YELLOW_PIXEL_THRESHOLD:
+					logging.info(f"YELLOW DETECTED! Pixel count: {yellow_count}")
+					detected("yellow", base_station_ip)
+					# Add small delay to avoid repeated detections
+					time.sleep(1)
+				
+			except Exception as e:
+				logging.error(f"[VIDEO] Error processing frame: {e}")
 				break
-			is_yellow_detected, processed_frame = detect_yellow(frame)
-			if is_yellow_detected:
-				logging.info("YELLOW DETECTED")
-				detected("yellow", base_station_ip)
-			cv2.imshow('Drone Detection', processed_frame)
-			if cv2.waitKey(1) & 0xFF == ord('q'):
-				break
-		cap.release()
-		cv2.destroyAllWindows()
-		logging.info("[VIDEO] Camera closed")
+		
+		logging.info("[VIDEO] Detection stopped")
+		
 	except Exception as e:
 		logging.error(f"[VIDEO] Error in video detection: {e}")
+	finally:
+		if picam2:
+			try:
+				picam2.stop()
+				logging.info("[VIDEO] Camera closed")
+			except:
+				pass
 
 
 def main():

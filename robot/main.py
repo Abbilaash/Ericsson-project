@@ -11,10 +11,11 @@ TCP_ACK_PORT = 9999          # Port for receiving ACK from base station
 BASE_STATION_TCP_PORT = 9998  # Port for sending messages TO base station
 HEARTBEAT_INTERVAL_SEC = 60
 
-ISSUE_TABLE = {
-	"yellow": "robots",
-	"orange": "robots",
-	"purple": "robots"
+# Issue types handled by this robot
+ISSUE_TYPES = {
+	"rust": "robot_task",
+	"overheated_circuit": "robot_task",
+	"tilted_antenna": "robot_task"
 }
 
 
@@ -196,29 +197,45 @@ def send_message_to_base_station(base_station_ip: str, message_type: str, conten
 			"content": content
 		}
 		
+		message_data = json.dumps(msg).encode('utf-8') + b'\n'
+		
 		with message_sender_lock:
-			# If no connection exists or it's broken, create a new one
-			if message_sender_socket is None:
+			# Try with existing connection first, then retry with new connection if it fails
+			for attempt in range(2):
+				# If no connection exists or it's broken, create a new one
+				if message_sender_socket is None:
+					try:
+						message_sender_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+						message_sender_socket.settimeout(5)
+						message_sender_socket.connect((base_station_ip, BASE_STATION_TCP_PORT))
+						logging.info(f"[SEND] Connected to base station at {base_station_ip}:{BASE_STATION_TCP_PORT}")
+					except Exception as e:
+						logging.error(f"[SEND] Failed to connect: {e}")
+						message_sender_socket = None
+						if attempt == 1:  # Last attempt
+							return False
+						continue
+				
 				try:
-					message_sender_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-					message_sender_socket.settimeout(5)
-					message_sender_socket.connect((base_station_ip, BASE_STATION_TCP_PORT))
-					logging.info(f"[SEND] Established persistent connection to base station at {base_station_ip}")
+					# Send JSON message with newline delimiter
+					logging.info(f"[SEND] Sending {len(message_data)} bytes: {message_type}")
+					message_sender_socket.sendall(message_data)
+					logging.info(f"[SEND] ✓ Successfully sent {message_type} message")
+					return True
 				except Exception as e:
-					logging.error(f"[SEND] Failed to establish connection: {e}")
+					logging.error(f"[SEND] ✗ Send failed (attempt {attempt + 1}/2): {e}")
+					# Close the broken connection
+					try:
+						message_sender_socket.close()
+					except:
+						pass
 					message_sender_socket = None
-					return False
+					
+					if attempt == 1:  # Last attempt failed
+						return False
+					# Otherwise, loop will retry with new connection
 			
-			try:
-				# Send JSON message with newline delimiter
-				message_data = json.dumps(msg).encode('utf-8') + b'\n'
-				message_sender_socket.sendall(message_data)
-				logging.info(f"[SEND] Sent {message_type} message to base station")
-				return True
-			except Exception as e:
-				logging.error(f"[SEND] Failed to send message: {e}")
-				message_sender_socket = None
-				return False
+			return False
 	
 	except Exception as e:
 		logging.error(f"[SEND] Error in send_message_to_base_station: {e}")
@@ -240,43 +257,102 @@ def handle_forward_message(msg: dict):
 		logging.warning(f"[MESSAGE] Unknown message type: {message_type}")
 
 
-def handle_movement_command(msg: dict):
+def handle_movement_command(msg: dict, base_station_ip: str = None):
 	"""Handle movement commands from base station"""
 	global current_task
 	
 	content = msg.get("content", {})
-	color = content.get("color")
+	
+	# Accept either "issue_type" or "color" (for backward compatibility with old base station)
+	issue_type = content.get("issue_type") or content.get("color")
 	coordinates = content.get("coordinates")
 	command = content.get("command")
 	message_id = msg.get("message_id")
-	
-	logging.info(f"[MOVEMENT] Received movement command: {command}")
-	logging.info(f"[MOVEMENT] Color: {color}, Coordinates: {coordinates}, Message ID: {message_id}")
+
+	# Validate required fields before proceeding
+	if not issue_type:
+		logging.error("[MOVEMENT] Missing issue_type/color in movement command; skipping")
+		logging.error(f"[MOVEMENT] DEBUG - content keys: {list(content.keys())}")
+		return
+	if not coordinates or not isinstance(coordinates, dict):
+		logging.error("[MOVEMENT] Missing or invalid coordinates in movement command; skipping")
+		return
+
+	logging.info(f"[MOVEMENT] ═══════════════════════════════════════════")
+	logging.info(f"[MOVEMENT] NEW TASK ASSIGNED")
+	logging.info(f"[MOVEMENT] Issue type to rectify: {issue_type.upper()}")
+	logging.info(f"[MOVEMENT] Location: X={coordinates.get('x')}, Y={coordinates.get('y')}, Z={coordinates.get('z')}")
+	logging.info(f"[MOVEMENT] Task ID: {message_id}")
+	logging.info(f"[MOVEMENT] ═══════════════════════════════════════════")
 	
 	# Store current task
 	with task_lock:
 		current_task = {
 			"message_id": message_id,
-			"color": color,
+			"issue_type": issue_type,
 			"coordinates": coordinates,
 			"command": command,
 			"received_at": time.time(),
-			"status": "received"
+			"status": "in_progress"
 		}
 	
-	# Simulate movement to location
+	# Perform the movement and rectification
 	if command == "move_to_location":
-		logging.info(f"[MOVEMENT] Starting movement to {coordinates} for color {color}")
-		logging.info(f"[MOVEMENT] Simulating movement (replace with actual motor control)")
-		
-		# TODO: Replace with actual movement logic
-		# For now, just log the movement
-		time.sleep(2)  # Simulate movement time
-		
-		with task_lock:
-			if current_task:
-				current_task["status"] = "completed"
-				logging.info(f"[MOVEMENT] Reached location {coordinates}")
+		try:
+			# Step 1: Move to location
+			logging.info(f"[MOVEMENT] → Moving to coordinates: {coordinates}")
+			logging.info(f"[MOVEMENT] → Motor control: Activating movement...")
+			# TODO: Replace with actual motor control code
+			# e.g., motor_controller.move_to(coordinates['x'], coordinates['y'], coordinates['z'])
+			time.sleep(3)  # Simulate travel time
+			logging.info(f"[MOVEMENT] ✓ Arrived at location")
+			
+			# Step 2: Rectify the issue
+			logging.info(f"[MOVEMENT] → Starting issue rectification for {issue_type.upper()}")
+			logging.info(f"[MOVEMENT] → Activating remediation mechanism...")
+			# TODO: Replace with actual rectification mechanism
+			# e.g., remediation_system.fix_issue(issue_type)
+			time.sleep(2)  # Simulate remediation time
+			logging.info(f"[MOVEMENT] ✓ Issue {issue_type.upper()} rectified successfully")
+			
+			# Step 3: Update task status
+			with task_lock:
+				if current_task:
+					current_task["status"] = "completed"
+					current_task["completed_at"] = time.time()
+			
+			# Step 4: Report completion back to base station
+			if base_station_ip:
+				completion_report = {
+					"task_id": message_id,
+					"issue_type": issue_type,
+					"coordinates": coordinates,
+					"status": "completed",
+					"message": f"Successfully rectified {issue_type} at location {coordinates}"
+				}
+				
+				logging.info(f"[MOVEMENT] → Reporting task completion to base station...")
+				success = send_message_to_base_station(base_station_ip, "TASK_COMPLETED", completion_report)
+				
+				if success:
+					logging.info(f"[MOVEMENT] ✓ Task completion reported to base station")
+				else:
+					logging.error(f"[MOVEMENT] ✗ Failed to report completion to base station")
+			
+			logging.info(f"[MOVEMENT] ═══════════════════════════════════════════")
+			logging.info(f"[MOVEMENT] TASK COMPLETED - Ready for next assignment")
+			logging.info(f"[MOVEMENT] ═══════════════════════════════════════════\n")
+			
+			# Clear current task
+			with task_lock:
+				current_task = None
+				
+		except Exception as e:
+			logging.error(f"[MOVEMENT] ✗ Error during task execution: {e}")
+			with task_lock:
+				if current_task:
+					current_task["status"] = "failed"
+					current_task["error"] = str(e)
 
 
 def cleanup_connections():
@@ -292,7 +368,7 @@ def cleanup_connections():
 			message_sender_socket = None
 
 
-def receive_messages(stop_event: threading.Event) -> None:
+def receive_messages(stop_event: threading.Event, base_station_ip: str = None) -> None:
 	"""Listen for incoming messages from base station on TCP port 9999"""
 	try:
 		server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -336,7 +412,7 @@ def receive_messages(stop_event: threading.Event) -> None:
 									# Handle movement command in a separate thread
 									threading.Thread(
 										target=handle_movement_command,
-										args=(msg,),
+										args=(msg, base_station_ip),
 										daemon=True
 									).start()
 								elif message_type in ["FORWARD_ALL", "FORWARD_TO"]:
@@ -378,8 +454,8 @@ def main():
 	hb_thread = threading.Thread(target=send_heartbeat, args=(base_ip, stop_event), daemon=True)
 	hb_thread.start()
 	
-	# Start message receiver thread
-	msg_thread = threading.Thread(target=receive_messages, args=(stop_event,), daemon=True)
+	# Start message receiver thread with base_ip for task completion reporting
+	msg_thread = threading.Thread(target=receive_messages, args=(stop_event, base_ip), daemon=True)
 	msg_thread.start()
 	
 	try:

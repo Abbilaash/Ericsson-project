@@ -453,6 +453,7 @@ function Dashboard() {
                   <th>Robot ID</th>
                   <th>Status</th>
                   <th>Battery %</th>
+                  <th>Task</th>
                   <th>Actions</th>
                 </tr>
               </thead>
@@ -462,6 +463,18 @@ function Dashboard() {
                     <td>{robot.id}</td>
                     <td>{robot.busy ? 'BUSY' : 'IDLE'}</td>
                     <td>{robot.battery ? robot.battery.toFixed(1) : 'N/A'}%</td>
+                    <td>
+                      <div
+                        style={{
+                          color: robot.task_id ? '#fbbf24' : '#22c55e',
+                          fontWeight: '600',
+                          minWidth: '150px'
+                        }}
+                        title={robot.task_color ? `Color: ${robot.task_color}` : 'No task assigned'}
+                      >
+                        {robot.task_id ? `${robot.task_color?.toUpperCase() || 'PROCESSING'}` : 'Ready'}
+                      </div>
+                    </td>
                     <td>
                       <div className="menu-container" style={{ position: 'relative' }}>
                         <button

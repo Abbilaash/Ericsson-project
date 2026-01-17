@@ -5,6 +5,8 @@ import threading
 import logging
 import os
 import numpy as np
+import cv2
+import requests
 from picamera2 import Picamera2
 
 
@@ -13,14 +15,15 @@ TCP_ACK_PORT = 9999          # Port for receiving ACK from base station
 BASE_STATION_TCP_PORT = 9998  # Port for sending messages TO base station
 HEARTBEAT_INTERVAL_SEC = 60
 
-# Yellow detection threshold
-YELLOW_PIXEL_THRESHOLD = 500
-
-ISSUE_TABLE = {
-	"yellow": "robots",
-	"orange": "robots",
-	"purple": "robots"
+# QR Code to Issue Type Mapping
+QR_CODE_TO_ISSUE = {
+	"RUST_QR": "rust",
+	"CIRCUIT_QR": "overheated_circuit",
+	"ANTENNA_QR": "tilted_antenna"
 }
+
+# API Base URL for fetching QR data (adjust as needed)
+API_BASE_URL = "http://localhost:5000/api"
 
 
 logging.basicConfig(
@@ -183,59 +186,93 @@ def send_message_to_base_station(base_station_ip: str, message_type: str, conten
 			"content": content
 		}
 		
+		message_data = json.dumps(msg).encode('utf-8') + b'\n'
+		
 		with message_sender_lock:
-			# If no connection exists or it's broken, create a new one
-			if message_sender_socket is None:
+			# Try with existing connection first, then retry with new connection if it fails
+			for attempt in range(2):
+				# If no connection exists or it's broken, create a new one
+				if message_sender_socket is None:
+					try:
+						message_sender_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+						message_sender_socket.settimeout(5)
+						message_sender_socket.connect((base_station_ip, BASE_STATION_TCP_PORT))
+						logging.info(f"[SEND] Connected to base station at {base_station_ip}:{BASE_STATION_TCP_PORT}")
+					except Exception as e:
+						logging.error(f"[SEND] Failed to connect: {e}")
+						message_sender_socket = None
+						if attempt == 1:  # Last attempt
+							return False
+						continue
+				
 				try:
-					message_sender_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-					message_sender_socket.settimeout(5)
-					message_sender_socket.connect((base_station_ip, BASE_STATION_TCP_PORT))
-					logging.info(f"[SEND] Established persistent connection to base station at {base_station_ip}:{BASE_STATION_TCP_PORT}")
+					# Send JSON message with newline delimiter
+					logging.info(f"[SEND] Sending {len(message_data)} bytes: {message_type}")
+					message_sender_socket.sendall(message_data)
+					logging.info(f"[SEND] ✓ Successfully sent {message_type} message")
+					return True
 				except Exception as e:
-					logging.error(f"[SEND] Failed to establish connection: {e}")
+					logging.error(f"[SEND] ✗ Send failed (attempt {attempt + 1}/2): {e}")
+					# Close the broken connection
+					try:
+						message_sender_socket.close()
+					except:
+						pass
 					message_sender_socket = None
-					return False
+					
+					if attempt == 1:  # Last attempt failed
+						return False
+					# Otherwise, loop will retry with new connection
 			
-			try:
-				# Send JSON message with newline delimiter
-				message_data = json.dumps(msg).encode('utf-8') + b'\n'
-				logging.info(f"[SEND] Sending {len(message_data)} bytes: {message_type}")
-				message_sender_socket.sendall(message_data)
-				logging.info(f"[SEND] ✓ Successfully sent {message_type} message to base station")
-				return True
-			except Exception as e:
-				logging.error(f"[SEND] ✗ Failed to send message: {e}")
-				message_sender_socket = None
-				return False
+			return False
 	
 	except Exception as e:
 		logging.error(f"[SEND] Error in send_message_to_base_station: {e}")
 		return False
 
 
-def detected(issue: str, base_station_ip: str = None):
-	logging.info(f"[DETECTION] Issue detected: {issue}")
-	if issue in ISSUE_TABLE:
-		target = ISSUE_TABLE[issue]
-		logging.info(f"[DETECTION] {issue.upper()} detected! Notifying {target}")
-		
-		# Dummy coordinates - replace with actual camera coordinates if available
-		coordinates = {
-			"x": 100,
-			"y": 150,
-			"z": 0
+def qr_detected(api_url: str, base_station_ip: str = None) -> str | None:
+	"""Handle QR code detection when the QR payload is an API URL.
+	Returns the issue_type if fetched successfully so caller can dedupe."""
+	logging.info(f"[QR] QR code detected; treating as API URL: {api_url}")
+
+	api_data: dict = {}
+	issue_type: str | None = None
+	try:
+		response = requests.get(api_url, timeout=5)
+		if response.status_code == 200:
+			api_data = response.json()
+			issue_type = api_data.get("issue_type")
+			logging.info(f"[QR] ✓ API data fetched: {api_data}")
+			print(f"\n[QR] Scanned API: {api_url}")
+			print(f"[QR] Data: {json.dumps(api_data, indent=2)}\n")
+		else:
+			logging.warning(f"[QR] API returned status {response.status_code}")
+			api_data = {"error": f"API returned status {response.status_code}"}
+	except requests.exceptions.Timeout:
+		logging.warning("[QR] API request timed out")
+		api_data = {"error": "API request timed out"}
+	except requests.exceptions.ConnectionError:
+		logging.warning("[QR] Could not connect to API")
+		api_data = {"error": "Could not connect to API"}
+	except Exception as e:
+		logging.warning(f"[QR] Error fetching API data: {e}")
+		api_data = {"error": str(e)}
+
+	# Send QR_SCAN message to base station if we know the issue type
+	if base_station_ip and issue_type:
+		content = {
+			"qr_code": api_url,
+			"issue_type": issue_type,
+			"api_data": api_data,
+			"message": f"QR API {api_url} detected by {device_id}",
+			"timestamp": time.time()
 		}
-		
-		# Send FORWARD_TO message to base station to relay to robots
-		if base_station_ip:
-			content = {
-				"issue_type": issue,
-				"color": issue,
-				"coordinates": coordinates,
-				"message": f"{issue.upper()} detected by {device_id} at coordinates {coordinates}",
-				"timestamp": time.time()
-			}
-			send_message_to_base_station(base_station_ip, "FORWARD_TO", content)
+		send_message_to_base_station(base_station_ip, "QR_SCAN", content)
+	elif base_station_ip:
+		logging.warning("[QR] No issue_type in API response; skipping send to base station")
+
+	return issue_type
 
 
 def handle_forward_message(msg: dict):
@@ -300,77 +337,51 @@ def receive_messages(stop_event: threading.Event) -> None:
 
 
 def start_video_detection(stop_event: threading.Event, base_station_ip: str = None) -> None:
-	"""Detect yellow, orange, and purple colors using PiCamera2"""
+	"""Detect and decode QR codes using PiCamera2 and OpenCV"""
 	picam2 = None
+	sent_issues = set()  # Track which issues have already been sent to base station
 	try:
 		# Setup the Camera
-		logging.info("[VIDEO] Initializing PiCamera2...")
+		logging.info("[VIDEO] Initializing PiCamera2 for QR code detection...")
 		picam2 = Picamera2()
 		config = picam2.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
 		picam2.configure(config)
 		picam2.start()
 		
+		# Initialize OpenCV QR Code Detector
+		detector = cv2.QRCodeDetector()
+		
 		# Wait for camera to stabilize
 		time.sleep(2)
-		logging.info("[VIDEO] Camera initialized, starting detection")
-		
-		# Define Color Ranges (RGB)
-		# Yellow: R > 150, G > 150, B < 100
-		yellow_lower = np.array([150, 150, 0])
-		yellow_upper = np.array([255, 255, 100])
-		
-		# Orange: R > 200, G 100-165, B < 100
-		orange_lower = np.array([200, 100, 0])
-		orange_upper = np.array([255, 165, 100])
-		
-		# Purple: R 100-200, G < 100, B > 100
-		purple_lower = np.array([100, 0, 100])
-		purple_upper = np.array([200, 100, 255])
-		
-		last_detection_time = {}  # Track last detection time for each color
-		detection_cooldown = 2  # Seconds between detections of same color
+		logging.info("[VIDEO] Camera initialized, starting QR code detection")
 		
 		while not stop_event.is_set():
 			try:
-				# Capture frame as NumPy array
 				frame = picam2.capture_array()
-				current_time = time.time()
+				gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+				qr_data, bbox, _ = detector.detectAndDecode(gray)
 				
-				# Detect Yellow
-				yellow_mask = np.all((frame >= yellow_lower) & (frame <= yellow_upper), axis=-1)
-				yellow_count = np.sum(yellow_mask)
+				# If QR data is found, treat it as an API URL to fetch issue data
+				if qr_data:
+					if qr_data in sent_issues:
+						logging.debug(f"[VIDEO] API {qr_data} already sent, ignoring")
+					else:
+						issue_type = qr_detected(qr_data, base_station_ip)
+						if issue_type:
+							sent_issues.add(qr_data)
+							sent_issues.add(issue_type)
+							logging.info(f"[VIDEO] Stored '{issue_type}' / {qr_data} in sent list")
+						else:
+							logging.debug(f"[VIDEO] API {qr_data} did not return issue_type; not storing")
 				
-				if yellow_count > YELLOW_PIXEL_THRESHOLD:
-					if current_time - last_detection_time.get("yellow", 0) > detection_cooldown:
-						logging.info(f"[DETECTION] YELLOW detected! Pixel count: {yellow_count}")
-						detected("yellow", base_station_ip)
-						last_detection_time["yellow"] = current_time
-				
-				# Detect Orange
-				orange_mask = np.all((frame >= orange_lower) & (frame <= orange_upper), axis=-1)
-				orange_count = np.sum(orange_mask)
-				
-				if orange_count > YELLOW_PIXEL_THRESHOLD:
-					if current_time - last_detection_time.get("orange", 0) > detection_cooldown:
-						logging.info(f"[DETECTION] ORANGE detected! Pixel count: {orange_count}")
-						detected("orange", base_station_ip)
-						last_detection_time["orange"] = current_time
-				
-				# Detect Purple
-				purple_mask = np.all((frame >= purple_lower) & (frame <= purple_upper), axis=-1)
-				purple_count = np.sum(purple_mask)
-				
-				if purple_count > YELLOW_PIXEL_THRESHOLD:
-					if current_time - last_detection_time.get("purple", 0) > detection_cooldown:
-						logging.info(f"[DETECTION] PURPLE detected! Pixel count: {purple_count}")
-						detected("purple", base_station_ip)
-						last_detection_time["purple"] = current_time
+				# Small delay to prevent CPU spinning
+				time.sleep(0.01)
 				
 			except Exception as e:
 				logging.error(f"[VIDEO] Error processing frame: {e}")
 				break
 		
-		logging.info("[VIDEO] Detection stopped")
+		logging.info("[VIDEO] QR code detection stopped")
 		
 	except Exception as e:
 		logging.error(f"[VIDEO] Error in video detection: {e}")

@@ -24,6 +24,32 @@ UDP_PORT = 8888
 BUFFER_SIZE = 8192
 BASE_STATION_IP = get_base_station_ip()
 
+# Issue type to location mappings with predefined coordinates
+ISSUE_LOCATIONS = {
+    "rust": {
+        "coordinates": {"x": 50, "y": 75, "z": 10},
+        "robot_count": 1,
+        "description": "Rust detected at location"
+    },
+    "overheated_circuit": {
+        "coordinates": {"x": 120, "y": 150, "z": 5},
+        "robot_count": 2,
+        "description": "Overheated circuit detected at location"
+    },
+    "tilted_antenna": {
+        "coordinates": {"x": 200, "y": 100, "z": 20},
+        "robot_count": 1,
+        "description": "Tilted antenna detected at location"
+    }
+}
+
+# QR code mapping to issue types
+QR_CODE_TO_ISSUE = {
+    "RUST_QR": "rust",
+    "CIRCUIT_QR": "overheated_circuit",
+    "ANTENNA_QR": "tilted_antenna"
+}
+
 connected_clients = {}
 clients_lock = threading.Lock()
 devices = {}
@@ -80,9 +106,9 @@ def tcp_server():
     try:
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind(("0.0.0.0", TCP_PORT))
+        server_sock.bind(("0.0.0.0", TCP_LISTEN_PORT))
         server_sock.listen(10)
-        print(f"[SERVER] TCP server listening on port {TCP_PORT}")
+        print(f"[SERVER] TCP server listening on port {TCP_LISTEN_PORT}")
         
         while True:
             try:
@@ -149,28 +175,65 @@ def handle_tcp_client(client_sock, client_ip):
                         sender_id = msg.get('sender_id') or client_ip
                         print(f"[TCP] Received from {client_ip}: {message_type}")
                         
-                        # If this is a color detection from drone, automatically assign robots
-                        if message_type == "FORWARD_TO":
+                        # If this is a QR code scan from drone, automatically assign robots
+                        if message_type == "QR_SCAN":
                             content = msg.get('content', {})
-                            color = content.get('color')
-                            coordinates = content.get('coordinates')
-                            issue_type = content.get('issue_type')
+                            qr_code = content.get('qr_code')
+                            api_data = content.get('api_data', {})
+                            issue_type = QR_CODE_TO_ISSUE.get(qr_code)
                             
-                            if color and coordinates:
+                            if issue_type and issue_type in ISSUE_LOCATIONS:
+                                issue_info = ISSUE_LOCATIONS[issue_type]
+                                coordinates = issue_info["coordinates"]
+                                
                                 print(f"\n[DETECTION] ╔════════════════════════════════════════════════════════════╗")
-                                print(f"[DETECTION] ║ COLOR DETECTED BY DRONE                                        ║")
-                                print(f"[DETECTION] ║ Color: {color.upper():<48} ║")
-                                print(f"[DETECTION] ║ Coordinates: X={coordinates.get('x', 0)}, Y={coordinates.get('y', 0)}, Z={coordinates.get('z', 0):<20} ║")
+                                print(f"[DETECTION] ║ QR CODE SCANNED BY DRONE                                      ║")
+                                print(f"[DETECTION] ║ Issue Type: {issue_type.upper():<43} ║")
+                                print(f"[DETECTION] ║ QR Code: {qr_code:<53} ║")
+                                print(f"[DETECTION] ║ API Data: {str(api_data):<49} ║")
+                                print(f"[DETECTION] ║ Location: X={coordinates.get('x', 0)}, Y={coordinates.get('y', 0)}, Z={coordinates.get('z', 0):<20} ║")
                                 print(f"[DETECTION] ║ Sender: {sender_id:<52} ║")
                                 print(f"[DETECTION] ║ Time: {time.strftime('%Y-%m-%d %H:%M:%S'):<50} ║")
                                 print(f"[DETECTION] ╚════════════════════════════════════════════════════════════╝\n")
                                 
                                 try:
-                                    handle_color_detection(color, coordinates)
+                                    handle_issue_detection(issue_type, coordinates, api_data)
                                 except Exception as e:
-                                    print(f"[TCP] ✗ Error in handle_color_detection: {e}")
+                                    print(f"[TCP] ✗ Error in handle_issue_detection: {e}")
                                     import traceback
                                     traceback.print_exc()
+                        elif message_type == "TASK_COMPLETED":
+                            content = msg.get('content', {})
+                            task_id = content.get('task_id') or msg.get('message_id')
+                            issue_type = content.get('issue_type')
+                            coordinates = content.get('coordinates', {})
+                            status = content.get('status')
+                            message = content.get('message')
+
+                            freed = False
+                            for dev_id, dev in devices.items():
+                                if dev_id == sender_id or dev.get("ip") == client_ip:
+                                    dev["task_id"] = None
+                                    dev["current_task"] = None
+                                    dev["status"] = "READY"
+                                    dev["updated_at"] = time.time()
+                                    freed = True
+                                    print(f"[TASK] ✓ Task completed by {dev_id} (status={status}, task_id={task_id})")
+                                    print(f"[TASK] ✓ Robot is now available for new assignments")
+                                    break
+
+                            if not freed:
+                                print(f"[TASK] ⚠ Received TASK_COMPLETED from unknown device {sender_id} / {client_ip}")
+
+                            log_packet(
+                                direction="in",
+                                transport="TCP",
+                                packet_type="STATUS",
+                                message_type="TASK_COMPLETED",
+                                sender_id=sender_id,
+                                receiver_id="base_station",
+                                payload=msg,
+                            )
                         
                         log_packet(
                             direction="in",
@@ -237,7 +300,7 @@ def udp_listener():
                 device_ip = msg.get('sender_ip') or addr[0]
                 position = msg.get('position')
                 message_type = msg.get('message_type')
-                reply_tcp_port = msg.get('reply_tcp_port', TCP_PORT)
+                reply_tcp_port = msg.get('reply_tcp_port', TCP_ROBOT_PORT)
                 device_type = msg.get('device_type', 'unknown')
 
                 log_packet(
@@ -322,7 +385,7 @@ def forward_to_all(receiver_category: str, message_content: dict):
                 try:
                     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
                         tcp.settimeout(2)
-                        tcp.connect((device_ip, TCP_PORT))
+                        tcp.connect((device_ip, TCP_ROBOT_PORT))
                         
                         forward_msg = {
                             "message_id": f"{int(timestamp * 1000000)}",
@@ -357,7 +420,7 @@ def forward_to_device(receiver_id: str, receiver_ip: str, message_content: dict)
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
             tcp.settimeout(2)
-            tcp.connect((receiver_ip, TCP_PORT))
+            tcp.connect((receiver_ip, TCP_ROBOT_PORT))
             
             forward_msg = {
                 "message_id": message_id,
@@ -433,7 +496,7 @@ def find_available_robots(count: int):
     return available
 
 
-def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, color: str):
+def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, issue_type: str):
     """
     Send a movement command to a specific robot
     Returns: (success, message_id)
@@ -456,7 +519,7 @@ def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, color
                 "receiver_id": robot_id,
                 "sender": "base_station",
                 "content": {
-                    "color": color,
+                    "issue_type": issue_type,
                     "coordinates": coordinates,
                     "command": "move_to_location"
                 }
@@ -467,7 +530,7 @@ def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, color
             tcp.sendall(message_data)
             print(f"[MOVEMENT] ✓ Message sent ({len(message_data)} bytes)")
             
-            print(f"[MOVEMENT] Sent movement command to {robot_id} at {robot_ip} for color {color} at {coordinates}")
+            print(f"[MOVEMENT] Sent movement command to {robot_id} at {robot_ip} for issue {issue_type} at {coordinates}")
             log_packet(
                 direction="out",
                 transport="TCP",
@@ -483,7 +546,7 @@ def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, color
                 if dev_id == robot_id or dev.get("ip") == robot_ip:
                     dev["task_id"] = message_id
                     dev["current_task"] = {
-                        "color": color,
+                        "issue_type": issue_type,
                         "coordinates": coordinates,
                         "assigned_at": time.time()
                     }
@@ -504,34 +567,34 @@ def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, color
         return False, None
 
 
-def handle_color_detection(color: str, coordinates: dict):
+def handle_issue_detection(issue_type: str, coordinates: dict, api_data: dict = None):
     """
-    Handle detection of a specific color and assign robots accordingly
-    - Yellow: 1 robot
-    - Orange: 2 robots
-    - Purple: 1 robot (default)
+    Handle detection of a specific issue type and assign robots accordingly
+    - rust: 1 robot
+    - overheated_circuit: 2 robots
+    - tilted_antenna: 1 robot
     """
-    # Determine how many robots to assign based on color
-    robot_count = 1  # default
-    if color.lower() == "orange":
-        robot_count = 2
-    elif color.lower() == "purple":
-        robot_count = 1
-    elif color.lower() == "yellow":
-        robot_count = 1
+    if issue_type not in ISSUE_LOCATIONS:
+        print(f"[ASSIGNMENT] ✗ Unknown issue type: {issue_type}")
+        return False
+    
+    issue_info = ISSUE_LOCATIONS[issue_type]
+    robot_count = issue_info["robot_count"]
     
     print(f"\n[ASSIGNMENT] ╔════════════════════════════════════════════════════════════╗")
     print(f"[ASSIGNMENT] ║ ROBOT ASSIGNMENT INITIATED                              ║")
-    print(f"[ASSIGNMENT] ║ Color: {color.upper():<48} ║")
+    print(f"[ASSIGNMENT] ║ Issue Type: {issue_type.upper():<43} ║")
     print(f"[ASSIGNMENT] ║ Required Robots: {robot_count:<45} ║")
     print(f"[ASSIGNMENT] ║ Location: ({coordinates.get('x', 0)}, {coordinates.get('y', 0)}, {coordinates.get('z', 0):<25}) ║")
+    if api_data:
+        print(f"[ASSIGNMENT] ║ API Data: {str(api_data):<49} ║")
     print(f"[ASSIGNMENT] ╚════════════════════════════════════════════════════════════╝\n")
     
     # Find available robots
     available_robots = find_available_robots(robot_count)
     
     if not available_robots:
-        print(f"[ASSIGNMENT] ⚠️  WARNING: No available robots for {color.upper()} detection")
+        print(f"[ASSIGNMENT] ⚠️  WARNING: No available robots for {issue_type.upper()} detection")
         print(f"[ASSIGNMENT] Available robots needed: {robot_count}, Found: 0\n")
         return False
     
@@ -540,9 +603,9 @@ def handle_color_detection(color: str, coordinates: dict):
     # Send movement command to each robot
     for idx, (robot_id, robot_ip) in enumerate(available_robots, 1):
         print(f"[ASSIGNMENT] → Assigning Robot {idx}/{len(available_robots)}: {robot_id} at {robot_ip}")
-        success, message_id = send_movement_command(robot_id, robot_ip, coordinates, color)
+        success, message_id = send_movement_command(robot_id, robot_ip, coordinates, issue_type)
         if not success:
-            print(f"[ASSIGNMENT] ✗ Failed to assign robot {robot_id} for {color.upper()} detection")
+            print(f"[ASSIGNMENT] ✗ Failed to assign robot {robot_id} for {issue_type.upper()} detection")
         else:
             print(f"[ASSIGNMENT] ✓ Successfully assigned robot {robot_id} (Message ID: {message_id})")
     
@@ -589,6 +652,12 @@ def api_overview():
             norm_id = f"DRONE_{ip.replace('.', '')}"
         else:
             norm_id = dev_id
+        
+        # Get task information
+        task_id = dev.get("task_id")
+        current_task = dev.get("current_task", {})
+        task_color = current_task.get("color") if task_id else None
+        
         entry = {
             "id": norm_id,
             "original_id": dev_id,
@@ -597,6 +666,9 @@ def api_overview():
             "last_seen": dev.get("updated_at"),
             "position": dev.get("position"),
             "ip": dev.get("ip"),
+            "task_id": task_id,
+            "task_color": task_color,
+            "is_busy": bool(task_id),  # True if robot has a task
         }
         if dtype == "robot":
             robots[norm_id] = entry
@@ -701,6 +773,72 @@ def api_send_message():
         "message_id": message_id,
         "message": "Message sent and task assigned" if success else "Failed to send message"
     })
+
+
+@app.route("/api/rust_location", methods=["GET"])
+def api_rust_location():
+    """Get predefined rust location and trigger robot assignment"""
+    issue_type = "rust"
+    issue_info = ISSUE_LOCATIONS.get(issue_type)
+    
+    if not issue_info:
+        return jsonify({"success": False, "error": "Rust location not configured"}), 400
+    
+    try:
+        handle_issue_detection(issue_type, issue_info["coordinates"])
+        return jsonify({
+            "success": True,
+            "issue_type": issue_type,
+            "coordinates": issue_info["coordinates"],
+            "description": issue_info["description"],
+            "robots_assigned": issue_info["robot_count"]
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/antenna_tilt_location", methods=["GET"])
+def api_antenna_tilt_location():
+    """Get predefined tilted antenna location and trigger robot assignment"""
+    issue_type = "tilted_antenna"
+    issue_info = ISSUE_LOCATIONS.get(issue_type)
+    
+    if not issue_info:
+        return jsonify({"success": False, "error": "Tilted antenna location not configured"}), 400
+    
+    try:
+        handle_issue_detection(issue_type, issue_info["coordinates"])
+        return jsonify({
+            "success": True,
+            "issue_type": issue_type,
+            "coordinates": issue_info["coordinates"],
+            "description": issue_info["description"],
+            "robots_assigned": issue_info["robot_count"]
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/circuit_overheat_location", methods=["GET"])
+def api_circuit_overheat_location():
+    """Get predefined overheated circuit location and trigger robot assignment"""
+    issue_type = "overheated_circuit"
+    issue_info = ISSUE_LOCATIONS.get(issue_type)
+    
+    if not issue_info:
+        return jsonify({"success": False, "error": "Overheated circuit location not configured"}), 400
+    
+    try:
+        handle_issue_detection(issue_type, issue_info["coordinates"])
+        return jsonify({
+            "success": True,
+            "issue_type": issue_type,
+            "coordinates": issue_info["coordinates"],
+            "description": issue_info["description"],
+            "robots_assigned": issue_info["robot_count"]
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":

@@ -9,7 +9,8 @@ from picamera2 import Picamera2
 
 
 UDP_SERVER_PORT = 8888 
-TCP_ACK_PORT = 9999   
+TCP_ACK_PORT = 9999          # Port for receiving ACK from base station
+BASE_STATION_TCP_PORT = 9998  # Port for sending messages TO base station
 HEARTBEAT_INTERVAL_SEC = 60
 
 # Yellow detection threshold
@@ -188,8 +189,8 @@ def send_message_to_base_station(base_station_ip: str, message_type: str, conten
 				try:
 					message_sender_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 					message_sender_socket.settimeout(5)
-					message_sender_socket.connect((base_station_ip, 9999))
-					logging.info(f"[SEND] Established persistent connection to base station at {base_station_ip}")
+					message_sender_socket.connect((base_station_ip, BASE_STATION_TCP_PORT))
+					logging.info(f"[SEND] Established persistent connection to base station at {base_station_ip}:{BASE_STATION_TCP_PORT}")
 				except Exception as e:
 					logging.error(f"[SEND] Failed to establish connection: {e}")
 					message_sender_socket = None
@@ -198,11 +199,12 @@ def send_message_to_base_station(base_station_ip: str, message_type: str, conten
 			try:
 				# Send JSON message with newline delimiter
 				message_data = json.dumps(msg).encode('utf-8') + b'\n'
+				logging.info(f"[SEND] Sending {len(message_data)} bytes: {message_type}")
 				message_sender_socket.sendall(message_data)
-				logging.info(f"[SEND] Sent {message_type} message to base station")
+				logging.info(f"[SEND] ✓ Successfully sent {message_type} message to base station")
 				return True
 			except Exception as e:
-				logging.error(f"[SEND] Failed to send message: {e}")
+				logging.error(f"[SEND] ✗ Failed to send message: {e}")
 				message_sender_socket = None
 				return False
 	

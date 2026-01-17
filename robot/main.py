@@ -7,7 +7,8 @@ import os
 
 
 UDP_SERVER_PORT = 8888 
-TCP_ACK_PORT = 9999   
+TCP_ACK_PORT = 9999          # Port for receiving ACK from base station
+BASE_STATION_TCP_PORT = 9998  # Port for sending messages TO base station
 HEARTBEAT_INTERVAL_SEC = 60
 
 ISSUE_TABLE = {
@@ -201,7 +202,7 @@ def send_message_to_base_station(base_station_ip: str, message_type: str, conten
 				try:
 					message_sender_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 					message_sender_socket.settimeout(5)
-					message_sender_socket.connect((base_station_ip, 9999))
+					message_sender_socket.connect((base_station_ip, BASE_STATION_TCP_PORT))
 					logging.info(f"[SEND] Established persistent connection to base station at {base_station_ip}")
 				except Exception as e:
 					logging.error(f"[SEND] Failed to establish connection: {e}")

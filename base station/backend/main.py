@@ -18,7 +18,8 @@ def get_base_station_ip():
     except:
         return "127.0.0.1"
 
-TCP_PORT = 9999
+TCP_LISTEN_PORT = 9998  # Port for receiving connections FROM drones/robots
+TCP_ROBOT_PORT = 9999   # Port for sending commands TO robots
 UDP_PORT = 8888
 BUFFER_SIZE = 8192
 BASE_STATION_IP = get_base_station_ip()
@@ -112,6 +113,9 @@ def handle_tcp_client(client_sock, client_ip):
     
     try:
         buffer = ""
+        print(f"[TCP] ✓ Successfully accepted connection from {client_ip}")
+        print(f"[TCP] Waiting for data from {client_ip}...")
+        
         while True:
             try:
                 # Receive data with timeout
@@ -119,8 +123,14 @@ def handle_tcp_client(client_sock, client_ip):
                 
                 # Empty data means the remote closed the connection
                 if not data:
-                    print(f"[TCP] Client {client_ip} closed connection")
+                    print(f"[TCP] ✗ Client {client_ip} closed connection (received 0 bytes)")
+                    print(f"[TCP] This usually means:")
+                    print(f"[TCP]   1. Client connected but never sent data")
+                    print(f"[TCP]   2. Client encountered an error before sending")
+                    print(f"[TCP]   3. Port conflict (client listening on same port it's trying to connect from)")
                     break
+                
+                print(f"[TCP] ✓ Received {len(data)} bytes from {client_ip}")
                 
                 # Decode and add to buffer
                 buffer += data.decode('utf-8', errors='ignore')
@@ -136,6 +146,7 @@ def handle_tcp_client(client_sock, client_ip):
                     try:
                         msg = json.loads(line)
                         message_type = msg.get('message_type', 'UNKNOWN')
+                        sender_id = msg.get('sender_id') or client_ip
                         print(f"[TCP] Received from {client_ip}: {message_type}")
                         
                         # If this is a color detection from drone, automatically assign robots
@@ -143,36 +154,59 @@ def handle_tcp_client(client_sock, client_ip):
                             content = msg.get('content', {})
                             color = content.get('color')
                             coordinates = content.get('coordinates')
+                            issue_type = content.get('issue_type')
                             
                             if color and coordinates:
-                                print(f"[TCP] Color detection received: {color} at {coordinates}")
-                                handle_color_detection(color, coordinates)
+                                print(f"\n[DETECTION] ╔════════════════════════════════════════════════════════════╗")
+                                print(f"[DETECTION] ║ COLOR DETECTED BY DRONE                                        ║")
+                                print(f"[DETECTION] ║ Color: {color.upper():<48} ║")
+                                print(f"[DETECTION] ║ Coordinates: X={coordinates.get('x', 0)}, Y={coordinates.get('y', 0)}, Z={coordinates.get('z', 0):<20} ║")
+                                print(f"[DETECTION] ║ Sender: {sender_id:<52} ║")
+                                print(f"[DETECTION] ║ Time: {time.strftime('%Y-%m-%d %H:%M:%S'):<50} ║")
+                                print(f"[DETECTION] ╚════════════════════════════════════════════════════════════╝\n")
+                                
+                                try:
+                                    handle_color_detection(color, coordinates)
+                                except Exception as e:
+                                    print(f"[TCP] ✗ Error in handle_color_detection: {e}")
+                                    import traceback
+                                    traceback.print_exc()
                         
                         log_packet(
                             direction="in",
                             transport="TCP",
                             packet_type="MESSAGE",
                             message_type=message_type,
-                            sender_id=msg.get('sender_id') or client_ip,
+                            sender_id=sender_id,
                             receiver_id="base_station",
                             payload=msg,
                         )
                     except json.JSONDecodeError as e:
                         print(f"[TCP] Failed to parse JSON from {client_ip}: {e}")
+                    except Exception as e:
+                        print(f"[TCP] ✗ Error processing message from {client_ip}: {e}")
+                        import traceback
+                        traceback.print_exc()
                     
             except socket.timeout:
                 # Timeout waiting for data is normal for idle connections
                 # Just continue waiting for more data
                 continue
             except Exception as e:
-                print(f"[TCP] Error receiving from {client_ip}: {e}")
+                print(f"[TCP] ✗ Error receiving from {client_ip}: {e}")
                 break
     
     except Exception as e:
-        print(f"[TCP] Error handling client {client_ip}: {e}")
+        print(f"[TCP] ✗ Error handling client {client_ip}: {e}")
+        import traceback
+        traceback.print_exc()
     
     finally:
-        client_sock.close()
+        try:
+            client_sock.close()
+        except:
+            pass
+        
         with clients_lock:
             if client_ip in connected_clients:
                 del connected_clients[client_ip]
@@ -380,14 +414,22 @@ def find_available_robots(count: int):
     Returns: list of (robot_id, robot_ip) tuples, may be less than count if not enough robots
     """
     available = []
+    print(f"[ROBOTS] Searching for {count} available robot(s)...")
+    print(f"[ROBOTS] Total devices in system: {len(devices)}")
+    
     for dev_id, dev in devices.items():
         device_type = dev.get("device_type", "").lower()
+        print(f"[ROBOTS] → Device: {dev_id}, Type: {device_type}, Has task_id: {bool(dev.get('task_id'))}")
+        
         if device_type == "robot":
             task_id = dev.get("task_id")
             if not task_id:
                 available.append((dev_id, dev.get("ip")))
+                print(f"[ROBOTS] ✓ Found available robot: {dev_id}")
                 if len(available) >= count:
                     break
+    
+    print(f"[ROBOTS] Found {len(available)}/{count} available robots\n")
     return available
 
 
@@ -399,10 +441,13 @@ def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, color
     timestamp = time.time()
     message_id = f"{int(timestamp * 1000000)}"
     
+    print(f"[MOVEMENT] Sending command to {robot_id} at {robot_ip}")
+    
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
             tcp.settimeout(2)
-            tcp.connect((robot_ip, TCP_PORT))
+            tcp.connect((robot_ip, TCP_ROBOT_PORT))
+            print(f"[MOVEMENT] ✓ Connected to {robot_ip}:{TCP_ROBOT_PORT}")
             
             movement_msg = {
                 "message_id": message_id,
@@ -416,7 +461,12 @@ def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, color
                     "command": "move_to_location"
                 }
             }
-            tcp.sendall(json.dumps(movement_msg).encode('utf-8') + b'\n')
+            
+            message_json = json.dumps(movement_msg)
+            message_data = message_json.encode('utf-8') + b'\n'
+            tcp.sendall(message_data)
+            print(f"[MOVEMENT] ✓ Message sent ({len(message_data)} bytes)")
+            
             print(f"[MOVEMENT] Sent movement command to {robot_id} at {robot_ip} for color {color} at {coordinates}")
             log_packet(
                 direction="out",
@@ -441,8 +491,16 @@ def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, color
                     break
             
             return True, message_id
+    except socket.timeout:
+        print(f"[MOVEMENT] ✗ Timeout connecting to {robot_id} at {robot_ip}:{TCP_ROBOT_PORT}")
+        return False, None
+    except ConnectionRefusedError:
+        print(f"[MOVEMENT] ✗ Connection refused by {robot_id} at {robot_ip}:{TCP_ROBOT_PORT}")
+        return False, None
     except Exception as e:
-        print(f"[MOVEMENT] Failed to send movement command to {robot_id} at {robot_ip}: {e}")
+        print(f"[MOVEMENT] ✗ Failed to send movement command to {robot_id} at {robot_ip}: {e}")
+        import traceback
+        traceback.print_exc()
         return False, None
 
 
@@ -462,21 +520,33 @@ def handle_color_detection(color: str, coordinates: dict):
     elif color.lower() == "yellow":
         robot_count = 1
     
-    print(f"[TASK] Color detected: {color}. Assigning {robot_count} robot(s)")
+    print(f"\n[ASSIGNMENT] ╔════════════════════════════════════════════════════════════╗")
+    print(f"[ASSIGNMENT] ║ ROBOT ASSIGNMENT INITIATED                              ║")
+    print(f"[ASSIGNMENT] ║ Color: {color.upper():<48} ║")
+    print(f"[ASSIGNMENT] ║ Required Robots: {robot_count:<45} ║")
+    print(f"[ASSIGNMENT] ║ Location: ({coordinates.get('x', 0)}, {coordinates.get('y', 0)}, {coordinates.get('z', 0):<25}) ║")
+    print(f"[ASSIGNMENT] ╚════════════════════════════════════════════════════════════╝\n")
     
     # Find available robots
     available_robots = find_available_robots(robot_count)
     
     if not available_robots:
-        print(f"[TASK] No available robots for {color} detection")
+        print(f"[ASSIGNMENT] ⚠️  WARNING: No available robots for {color.upper()} detection")
+        print(f"[ASSIGNMENT] Available robots needed: {robot_count}, Found: 0\n")
         return False
     
+    print(f"[ASSIGNMENT] ✓ Found {len(available_robots)} available robot(s)")
+    
     # Send movement command to each robot
-    for robot_id, robot_ip in available_robots:
+    for idx, (robot_id, robot_ip) in enumerate(available_robots, 1):
+        print(f"[ASSIGNMENT] → Assigning Robot {idx}/{len(available_robots)}: {robot_id} at {robot_ip}")
         success, message_id = send_movement_command(robot_id, robot_ip, coordinates, color)
         if not success:
-            print(f"[TASK] Failed to assign robot {robot_id} for {color} detection")
+            print(f"[ASSIGNMENT] ✗ Failed to assign robot {robot_id} for {color.upper()} detection")
+        else:
+            print(f"[ASSIGNMENT] ✓ Successfully assigned robot {robot_id} (Message ID: {message_id})")
     
+    print(f"[ASSIGNMENT] ═════════════════════════════════════════════════════════════\n")
     return True
 
 
@@ -635,7 +705,8 @@ def api_send_message():
 
 if __name__ == "__main__":
     print(f"\n[SERVER] Starting Network Server")
-    print(f"[SERVER] TCP Port: {TCP_PORT}")
+    print(f"[SERVER] TCP Listen Port (for drones/robots): {TCP_LISTEN_PORT}")
+    print(f"[SERVER] TCP Robot Port (for commands): {TCP_ROBOT_PORT}")
     print(f"[SERVER] UDP Port: {UDP_PORT}\n")
     
     threading.Thread(target=tcp_server, daemon=True).start()

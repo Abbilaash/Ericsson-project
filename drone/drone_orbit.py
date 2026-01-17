@@ -1,88 +1,95 @@
+from dronekit import connect, VehicleMode
 from pymavlink import mavutil
 import time
-import math
 
-# --------------------------------------------------
-# USER INPUTS
-# --------------------------------------------------
-CONNECTION = "COM11"     # or /dev/ttyACM0
-BAUD = 9600
+# -------------------------------
+# CONNECT TO VEHICLE
+# -------------------------------
+print("Connecting to Pixhawk...")
+vehicle = connect('COM11', baud=9600, wait_ready=True)
+# For real hardware, use:
+# vehicle = connect('/dev/ttyACM0', baud=57600, wait_ready=True)
 
-CENTER_X = 0.0           # meters (forward)
-CENTER_Y = 0.0           # meters (right)
-CENTER_Z = -1.0          # meters (up = negative)
+print("Connected")
 
-RADIUS = 1.0             # meters
-ANGULAR_SPEED = 0.3      # rad/sec (slow & safe)
-UPDATE_RATE = 10         # Hz
-# --------------------------------------------------
+# -------------------------------
+# CHECK MISSION EXISTS
+# -------------------------------
+cmds = vehicle.commands
+cmds.download()
+cmds.wait_ready()
 
+if cmds.count == 0:
+    print("No mission found on vehicle!")
+    vehicle.close()
+    exit(1)
 
-def arm_and_guided(master):
-    master.wait_heartbeat()
-    print("Heartbeat received")
+print(f"Mission with {cmds.count} waypoints found")
 
-    master.set_mode_apm("GUIDED")
-    time.sleep(2)
+# -------------------------------
+# WAIT UNTIL ARMABLE
+# -------------------------------
+while not vehicle.is_armable:
+    print("Waiting for vehicle to initialise...")
+    time.sleep(1)
 
-    master.mav.command_long_send(
-        master.target_system,
-        master.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0,
-        1, 0, 0, 0, 0, 0, 0
-    )
+# -------------------------------
+# ARM VEHICLE
+# -------------------------------
+print("Arming motors")
+vehicle.mode = VehicleMode("GUIDED")
+vehicle.armed = True
 
-    print("Arming...")
-    time.sleep(3)
+while not vehicle.armed:
+    print("Waiting for arming...")
+    time.sleep(1)
 
+print("Vehicle armed")
 
-print("Connecting...")
-master = mavutil.mavlink_connection(CONNECTION, baud=BAUD)
-arm_and_guided(master)
-
-print("Starting orbit...")
-
-theta = 0.0
-dt = 1.0 / UPDATE_RATE
-
-try:
-    while True:
-        # Position on circle
-        x = CENTER_X + RADIUS * math.cos(theta)
-        y = CENTER_Y + RADIUS * math.sin(theta)
-        z = CENTER_Z
-
-        # Yaw: point toward center
-        yaw = math.atan2(CENTER_Y - y, CENTER_X - x)
-
-        master.mav.set_position_target_local_ned_send(
-            0,
-            master.target_system,
-            master.target_component,
-            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            0b0000111111111000,   # Position + yaw enabled
-            x, y, z,              # position
-            0, 0, 0,              # velocity (ignored)
-            0, 0, 0,              # acceleration (ignored)
-            yaw, 0                # yaw, yaw_rate
-        )
-
-        theta += ANGULAR_SPEED * dt
-        time.sleep(dt)
-
-except KeyboardInterrupt:
-    print("Stopping orbit")
-
-# --------------------------------------------------
-# Stop & disarm
-# --------------------------------------------------
-master.mav.command_long_send(
-    master.target_system,
-    master.target_component,
-    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+# -------------------------------
+# REQUIRED FOR COPTER (on ground)
+# MAV_CMD_MISSION_START
+# -------------------------------
+print("Starting mission")
+vehicle._master.mav.command_long_send(
+    vehicle._master.target_system,
+    vehicle._master.target_component,
+    mavutil.mavlink.MAV_CMD_MISSION_START,
     0,
     0, 0, 0, 0, 0, 0, 0
 )
 
-print("Disarmed")
+time.sleep(1)
+
+# -------------------------------
+# SWITCH TO AUTO MODE
+# -------------------------------
+vehicle.mode = VehicleMode("AUTO")
+
+while vehicle.mode.name != "AUTO":
+    print("Waiting for AUTO mode...")
+    time.sleep(1)
+
+print("Mission started in AUTO mode")
+
+# -------------------------------
+# MONITOR MISSION PROGRESS
+# -------------------------------
+while True:
+    next_wp = vehicle.commands.next
+    print(f"Current Waypoint: {next_wp}")
+
+    if next_wp == cmds.count:
+        print("Final waypoint reached")
+        break
+
+    time.sleep(2)
+
+# -------------------------------
+# MISSION COMPLETE
+# -------------------------------
+print("Mission completed")
+print("Vehicle mode:", vehicle.mode.name)
+
+vehicle.close()
+print("Connection closed")

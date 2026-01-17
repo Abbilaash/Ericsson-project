@@ -135,12 +135,24 @@ def handle_tcp_client(client_sock, client_ip):
                     
                     try:
                         msg = json.loads(line)
-                        print(f"[TCP] Received from {client_ip}: {msg.get('message_type', 'UNKNOWN')}")
+                        message_type = msg.get('message_type', 'UNKNOWN')
+                        print(f"[TCP] Received from {client_ip}: {message_type}")
+                        
+                        # If this is a color detection from drone, automatically assign robots
+                        if message_type == "FORWARD_TO":
+                            content = msg.get('content', {})
+                            color = content.get('color')
+                            coordinates = content.get('coordinates')
+                            
+                            if color and coordinates:
+                                print(f"[TCP] Color detection received: {color} at {coordinates}")
+                                handle_color_detection(color, coordinates)
+                        
                         log_packet(
                             direction="in",
                             transport="TCP",
                             packet_type="MESSAGE",
-                            message_type=msg.get('message_type', 'UNKNOWN'),
+                            message_type=message_type,
                             sender_id=msg.get('sender_id') or client_ip,
                             receiver_id="base_station",
                             payload=msg,
@@ -360,6 +372,112 @@ def find_available_robot():
                 return dev_id, dev.get("ip")
     
     return None, None
+
+
+def find_available_robots(count: int):
+    """
+    Find N available robots that are not assigned to any task
+    Returns: list of (robot_id, robot_ip) tuples, may be less than count if not enough robots
+    """
+    available = []
+    for dev_id, dev in devices.items():
+        device_type = dev.get("device_type", "").lower()
+        if device_type == "robot":
+            task_id = dev.get("task_id")
+            if not task_id:
+                available.append((dev_id, dev.get("ip")))
+                if len(available) >= count:
+                    break
+    return available
+
+
+def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, color: str):
+    """
+    Send a movement command to a specific robot
+    Returns: (success, message_id)
+    """
+    timestamp = time.time()
+    message_id = f"{int(timestamp * 1000000)}"
+    
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
+            tcp.settimeout(2)
+            tcp.connect((robot_ip, TCP_PORT))
+            
+            movement_msg = {
+                "message_id": message_id,
+                "timestamp": int(timestamp),
+                "message_type": "MOVEMENT_COMMAND",
+                "receiver_id": robot_id,
+                "sender": "base_station",
+                "content": {
+                    "color": color,
+                    "coordinates": coordinates,
+                    "command": "move_to_location"
+                }
+            }
+            tcp.sendall(json.dumps(movement_msg).encode('utf-8') + b'\n')
+            print(f"[MOVEMENT] Sent movement command to {robot_id} at {robot_ip} for color {color} at {coordinates}")
+            log_packet(
+                direction="out",
+                transport="TCP",
+                packet_type="COMMAND",
+                message_type="MOVEMENT_COMMAND",
+                sender_id="base_station",
+                receiver_id=robot_id,
+                payload=movement_msg,
+            )
+            
+            # Update the robot's task_id to the message_id
+            for dev_id, dev in devices.items():
+                if dev_id == robot_id or dev.get("ip") == robot_ip:
+                    dev["task_id"] = message_id
+                    dev["current_task"] = {
+                        "color": color,
+                        "coordinates": coordinates,
+                        "assigned_at": time.time()
+                    }
+                    print(f"[MOVEMENT] Updated {dev_id} task_id to {message_id}")
+                    break
+            
+            return True, message_id
+    except Exception as e:
+        print(f"[MOVEMENT] Failed to send movement command to {robot_id} at {robot_ip}: {e}")
+        return False, None
+
+
+def handle_color_detection(color: str, coordinates: dict):
+    """
+    Handle detection of a specific color and assign robots accordingly
+    - Yellow: 1 robot
+    - Orange: 2 robots
+    - Purple: 1 robot (default)
+    """
+    # Determine how many robots to assign based on color
+    robot_count = 1  # default
+    if color.lower() == "orange":
+        robot_count = 2
+    elif color.lower() == "purple":
+        robot_count = 1
+    elif color.lower() == "yellow":
+        robot_count = 1
+    
+    print(f"[TASK] Color detected: {color}. Assigning {robot_count} robot(s)")
+    
+    # Find available robots
+    available_robots = find_available_robots(robot_count)
+    
+    if not available_robots:
+        print(f"[TASK] No available robots for {color} detection")
+        return False
+    
+    # Send movement command to each robot
+    for robot_id, robot_ip in available_robots:
+        success, message_id = send_movement_command(robot_id, robot_ip, coordinates, color)
+        if not success:
+            print(f"[TASK] Failed to assign robot {robot_id} for {color} detection")
+    
+    return True
 
 
 def cleanup_stale_devices():

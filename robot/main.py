@@ -10,6 +10,12 @@ UDP_SERVER_PORT = 8888
 TCP_ACK_PORT = 9999   
 HEARTBEAT_INTERVAL_SEC = 60
 
+ISSUE_TABLE = {
+	"yellow": "robots",
+	"orange": "robots",
+	"purple": "robots"
+}
+
 
 logging.basicConfig(
 	level=logging.INFO,
@@ -32,6 +38,10 @@ device_id = f"ROBOT_{sender_ip.replace('.', '')}"
 # Persistent connection to base station for sending messages
 message_sender_socket = None
 message_sender_lock = threading.Lock()
+
+# Current task/movement
+current_task = None
+task_lock = threading.Lock()
 
 def broadcast_join(reply_tcp_port: int = TCP_ACK_PORT) -> None:
 	timestamp = time.time()
@@ -214,6 +224,60 @@ def send_message_to_base_station(base_station_ip: str, message_type: str, conten
 		return False
 
 
+def handle_forward_message(msg: dict):
+	"""Handle FORWARD_ALL or FORWARD_TO messages from base station"""
+	message_type = msg.get("message_type", "")
+	content = msg.get("content", {})
+	
+	if message_type == "FORWARD_ALL":
+		logging.info(f"[MESSAGE] FORWARD_ALL received: {content}")
+		# Handle broadcast message
+	elif message_type == "FORWARD_TO":
+		logging.info(f"[MESSAGE] FORWARD_TO received: {content}")
+		# Handle direct message
+	else:
+		logging.warning(f"[MESSAGE] Unknown message type: {message_type}")
+
+
+def handle_movement_command(msg: dict):
+	"""Handle movement commands from base station"""
+	global current_task
+	
+	content = msg.get("content", {})
+	color = content.get("color")
+	coordinates = content.get("coordinates")
+	command = content.get("command")
+	message_id = msg.get("message_id")
+	
+	logging.info(f"[MOVEMENT] Received movement command: {command}")
+	logging.info(f"[MOVEMENT] Color: {color}, Coordinates: {coordinates}, Message ID: {message_id}")
+	
+	# Store current task
+	with task_lock:
+		current_task = {
+			"message_id": message_id,
+			"color": color,
+			"coordinates": coordinates,
+			"command": command,
+			"received_at": time.time(),
+			"status": "received"
+		}
+	
+	# Simulate movement to location
+	if command == "move_to_location":
+		logging.info(f"[MOVEMENT] Starting movement to {coordinates} for color {color}")
+		logging.info(f"[MOVEMENT] Simulating movement (replace with actual motor control)")
+		
+		# TODO: Replace with actual movement logic
+		# For now, just log the movement
+		time.sleep(2)  # Simulate movement time
+		
+		with task_lock:
+			if current_task:
+				current_task["status"] = "completed"
+				logging.info(f"[MOVEMENT] Reached location {coordinates}")
+
+
 def cleanup_connections():
 	"""Close persistent connections on shutdown"""
 	global message_sender_socket
@@ -227,6 +291,78 @@ def cleanup_connections():
 			message_sender_socket = None
 
 
+def receive_messages(stop_event: threading.Event) -> None:
+	"""Listen for incoming messages from base station on TCP port 9999"""
+	try:
+		server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		server_sock.bind(("0.0.0.0", TCP_ACK_PORT))
+		server_sock.listen(5)
+		logging.info(f"[MESSAGE] Listening for messages on port {TCP_ACK_PORT}")
+		
+		server_sock.settimeout(1)  # Non-blocking with timeout
+		
+		while not stop_event.is_set():
+			try:
+				client_sock, addr = server_sock.accept()
+				client_ip = addr[0]
+				logging.info(f"[MESSAGE] Incoming connection from {client_ip}")
+				
+				# Handle the incoming message (newline-delimited JSON)
+				try:
+					buffer = ""
+					while True:
+						data = client_sock.recv(4096)
+						if not data:
+							break
+						
+						buffer += data.decode('utf-8', errors='ignore')
+						
+						# Process complete messages (separated by newlines)
+						while '\n' in buffer:
+							line, buffer = buffer.split('\n', 1)
+							line = line.strip()
+							
+							if not line:
+								continue
+							
+							try:
+								msg = json.loads(line)
+								message_type = msg.get('message_type')
+								logging.info(f"[MESSAGE] Received: {message_type}")
+								
+								if message_type == "MOVEMENT_COMMAND":
+									# Handle movement command in a separate thread
+									threading.Thread(
+										target=handle_movement_command,
+										args=(msg,),
+										daemon=True
+									).start()
+								elif message_type in ["FORWARD_ALL", "FORWARD_TO"]:
+									handle_forward_message(msg)
+								else:
+									logging.info(f"[MESSAGE] Received: {message_type}")
+							except json.JSONDecodeError:
+								pass
+				
+				except Exception as e:
+					logging.error(f"[MESSAGE] Error processing message: {e}")
+				finally:
+					client_sock.close()
+			
+			except socket.timeout:
+				continue
+			except Exception as e:
+				logging.error(f"[MESSAGE] Error accepting connection: {e}")
+				break
+		
+		server_sock.close()
+		logging.info("[MESSAGE] Message server closed")
+	
+	except Exception as e:
+		logging.error(f"[MESSAGE] Error in receive_messages: {e}")
+
+
 def main():
 	broadcast_join(reply_tcp_port=TCP_ACK_PORT)
 	base_ip = wait_for_tcp_ack(listen_port=TCP_ACK_PORT, timeout_sec=120)
@@ -234,9 +370,17 @@ def main():
 		logging.error("No base station ACK received; exiting")
 		return
 	logging.info("Stored base station IP: %s", base_ip)
+	
 	stop_event = threading.Event()
+	
+	# Start heartbeat thread
 	hb_thread = threading.Thread(target=send_heartbeat, args=(base_ip, stop_event), daemon=True)
 	hb_thread.start()
+	
+	# Start message receiver thread
+	msg_thread = threading.Thread(target=receive_messages, args=(stop_event,), daemon=True)
+	msg_thread.start()
+	
 	try:
 		while True:
 			time.sleep(1)
@@ -245,6 +389,7 @@ def main():
 		stop_event.set()
 		cleanup_connections()
 		hb_thread.join(timeout=5)
+		msg_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

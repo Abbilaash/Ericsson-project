@@ -16,7 +16,9 @@ HEARTBEAT_INTERVAL_SEC = 60
 YELLOW_PIXEL_THRESHOLD = 500
 
 ISSUE_TABLE = {
-	"yellow":"robots"
+	"yellow": "robots",
+	"orange": "robots",
+	"purple": "robots"
 }
 
 
@@ -210,17 +212,25 @@ def send_message_to_base_station(base_station_ip: str, message_type: str, conten
 
 
 def detected(issue: str, base_station_ip: str = None):
-	"""Called when yellow or other issue is detected"""
 	logging.info(f"[DETECTION] Issue detected: {issue}")
 	if issue in ISSUE_TABLE:
 		target = ISSUE_TABLE[issue]
 		logging.info(f"[DETECTION] {issue.upper()} detected! Notifying {target}")
 		
+		# Dummy coordinates - replace with actual camera coordinates if available
+		coordinates = {
+			"x": 100,
+			"y": 150,
+			"z": 0
+		}
+		
 		# Send FORWARD_TO message to base station to relay to robots
 		if base_station_ip:
 			content = {
 				"issue_type": issue,
-				"message": f"{issue.upper()} detected by {device_id}",
+				"color": issue,
+				"coordinates": coordinates,
+				"message": f"{issue.upper()} detected by {device_id} at coordinates {coordinates}",
 				"timestamp": time.time()
 			}
 			send_message_to_base_station(base_station_ip, "FORWARD_TO", content)
@@ -288,7 +298,7 @@ def receive_messages(stop_event: threading.Event) -> None:
 
 
 def start_video_detection(stop_event: threading.Event, base_station_ip: str = None) -> None:
-	"""Detect yellow color using PiCamera2"""
+	"""Detect yellow, orange, and purple colors using PiCamera2"""
 	picam2 = None
 	try:
 		# Setup the Camera
@@ -302,26 +312,57 @@ def start_video_detection(stop_event: threading.Event, base_station_ip: str = No
 		time.sleep(2)
 		logging.info("[VIDEO] Camera initialized, starting detection")
 		
-		# Define Yellow Range (RGB)
-		lower_yellow = np.array([150, 150, 0])   # R > 150, G > 150, B < 100
-		upper_yellow = np.array([255, 255, 100])
+		# Define Color Ranges (RGB)
+		# Yellow: R > 150, G > 150, B < 100
+		yellow_lower = np.array([150, 150, 0])
+		yellow_upper = np.array([255, 255, 100])
+		
+		# Orange: R > 200, G 100-165, B < 100
+		orange_lower = np.array([200, 100, 0])
+		orange_upper = np.array([255, 165, 100])
+		
+		# Purple: R 100-200, G < 100, B > 100
+		purple_lower = np.array([100, 0, 100])
+		purple_upper = np.array([200, 100, 255])
+		
+		last_detection_time = {}  # Track last detection time for each color
+		detection_cooldown = 2  # Seconds between detections of same color
 		
 		while not stop_event.is_set():
 			try:
 				# Capture frame as NumPy array
 				frame = picam2.capture_array()
+				current_time = time.time()
 				
-				# Create mask for yellow pixels
-				mask = np.all((frame >= lower_yellow) & (frame <= upper_yellow), axis=-1)
-				
-				# Count yellow pixels
-				yellow_count = np.sum(mask)
+				# Detect Yellow
+				yellow_mask = np.all((frame >= yellow_lower) & (frame <= yellow_upper), axis=-1)
+				yellow_count = np.sum(yellow_mask)
 				
 				if yellow_count > YELLOW_PIXEL_THRESHOLD:
-					logging.info(f"YELLOW DETECTED! Pixel count: {yellow_count}")
-					detected("yellow", base_station_ip)
-					# Add small delay to avoid repeated detections
-					time.sleep(1)
+					if current_time - last_detection_time.get("yellow", 0) > detection_cooldown:
+						logging.info(f"[DETECTION] YELLOW detected! Pixel count: {yellow_count}")
+						detected("yellow", base_station_ip)
+						last_detection_time["yellow"] = current_time
+				
+				# Detect Orange
+				orange_mask = np.all((frame >= orange_lower) & (frame <= orange_upper), axis=-1)
+				orange_count = np.sum(orange_mask)
+				
+				if orange_count > YELLOW_PIXEL_THRESHOLD:
+					if current_time - last_detection_time.get("orange", 0) > detection_cooldown:
+						logging.info(f"[DETECTION] ORANGE detected! Pixel count: {orange_count}")
+						detected("orange", base_station_ip)
+						last_detection_time["orange"] = current_time
+				
+				# Detect Purple
+				purple_mask = np.all((frame >= purple_lower) & (frame <= purple_upper), axis=-1)
+				purple_count = np.sum(purple_mask)
+				
+				if purple_count > YELLOW_PIXEL_THRESHOLD:
+					if current_time - last_detection_time.get("purple", 0) > detection_cooldown:
+						logging.info(f"[DETECTION] PURPLE detected! Pixel count: {purple_count}")
+						detected("purple", base_station_ip)
+						last_detection_time["purple"] = current_time
 				
 			except Exception as e:
 				logging.error(f"[VIDEO] Error processing frame: {e}")

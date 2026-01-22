@@ -3,9 +3,12 @@ import json
 import threading
 import time
 from flask import Flask, jsonify, request
+from collections import deque, defaultdict
 import flask_cors
-
-# NOTE: FORWARD_ALL, FORWARD_TO
+import math
+import random
+import pickle
+import os
 
 
 def get_base_station_ip():
@@ -27,7 +30,7 @@ BASE_STATION_IP = get_base_station_ip()
 # Issue type to location mappings with predefined coordinates
 ISSUE_LOCATIONS = {
     "rust": {
-        "coordinates": {"x": 50, "y": 75, "z": 10},
+        "coordinates": {"x": 65, "y": 100, "z": 10},
         "robot_count": 1,
         "description": "Rust detected at location"
     },
@@ -53,9 +56,146 @@ QR_CODE_TO_ISSUE = {
 connected_clients = {}
 clients_lock = threading.Lock()
 devices = {}
+devices_lock = threading.Lock()
 network_logs = []
 logs_lock = threading.Lock()
 MAX_LOGS = 500
+
+# Track detected issues with their locations and status
+detected_issues = {}  # Format: {issue_key: {"issue_type": "...", "coordinates": {...}, "timestamp": ..., "drone_id": "..."}}
+issues_lock = threading.Lock()
+
+# Queue to hold pending issues when no robots are available
+pending_issues = deque()  # Each item: {issue_key, issue_type, coordinates, api_data, robot_count, enqueued_at}
+pending_lock = threading.Lock()
+
+# Command logs for tracking drone/robot control commands
+command_logs = []  # Format: {drone_id, command, base_station_ip, timestamp}
+command_logs_lock = threading.Lock()
+
+# ==================== Q-LEARNING ROBOT SELECTION ====================
+# Q-learning parameters
+ALPHA = 0.1          # Learning rate
+GAMMA = 0.9          # Discount factor (not used in single-step reward)
+EPSILON = 0.15       # Exploration rate (15% random selection)
+
+# Q-table: Q[(state, action)] = expected reward
+# State: (issue_type, distance_bucket, robot_availability)
+# Action: robot_id
+Q_table = defaultdict(lambda: defaultdict(float))  # Q[state][robot_id] = value
+Q_table_lock = threading.Lock()
+
+# Track task assignments for reward calculation
+active_tasks = {}  # task_id -> {robot_id, issue_type, distance, assigned_at}
+tasks_lock = threading.Lock()
+
+# Q-table persistence
+Q_TABLE_FILE = "q_table.pkl"
+
+def load_q_table():
+	"""Load Q-table from disk if exists"""
+	global Q_table
+	if os.path.exists(Q_TABLE_FILE):
+		try:
+			with open(Q_TABLE_FILE, 'rb') as f:
+				Q_table = pickle.load(f)
+			print(f"[Q-LEARN] ✓ Loaded Q-table with {len(Q_table)} states")
+		except Exception as e:
+			print(f"[Q-LEARN] ⚠ Failed to load Q-table: {e}")
+
+def save_q_table():
+	"""Save Q-table to disk"""
+	try:
+		with Q_table_lock:
+			with open(Q_TABLE_FILE, 'wb') as f:
+				pickle.dump(dict(Q_table), f)
+			print(f"[Q-LEARN] ✓ Saved Q-table with {len(Q_table)} states")
+	except Exception as e:
+		print(f"[Q-LEARN] ⚠ Failed to save Q-table: {e}")
+
+def calculate_distance(pos1: dict, pos2: dict) -> float:
+	"""Calculate 2D distance between two positions"""
+	dx = pos2.get('x', 0) - pos1.get('x', 0)
+	dy = pos2.get('y', 0) - pos1.get('y', 0)
+	return math.sqrt(dx*dx + dy*dy)
+
+def get_distance_bucket(distance: float) -> str:
+	"""Convert distance to bucket for state representation"""
+	if distance < 30:
+		return "near"
+	elif distance < 60:
+		return "medium"
+	else:
+		return "far"
+
+def get_state(issue_type: str, robot_position: dict, issue_coordinates: dict) -> tuple:
+	"""Extract state for Q-learning"""
+	distance = calculate_distance(robot_position, issue_coordinates)
+	dist_bucket = get_distance_bucket(distance)
+	return (issue_type, dist_bucket)
+
+def smart_select_robot(issue_type: str, issue_coordinates: dict, required_count: int = 1):
+	"""
+	Select robots using Q-learning (epsilon-greedy)
+	Returns: list of (robot_id, robot_ip, state) tuples
+	"""
+	available_robots = []
+	
+	# Find all available robots with their positions
+	for dev_id, dev in devices.items():
+		if dev.get("device_type", "").lower() == "robot" and not dev.get("task_id"):
+			robot_pos = dev.get("position", {"x": 0, "y": 0, "z": 0})
+			# Parse position if it's a string
+			if isinstance(robot_pos, str):
+				import re
+				match = re.match(r'\(([^,]+),\s*([^,]+),\s*([^)]+)\)', robot_pos)
+				if match:
+					robot_pos = {"x": float(match.group(1)), "y": float(match.group(2)), "z": float(match.group(3))}
+				else:
+					robot_pos = {"x": 0, "y": 0, "z": 0}
+			
+			state = get_state(issue_type, robot_pos, issue_coordinates)
+			available_robots.append((dev_id, dev.get("ip"), state, robot_pos))
+	
+	if not available_robots:
+		return []
+	
+	# Limit to required count
+	available_robots = available_robots[:required_count]
+	selected = []
+	
+	for robot_id, robot_ip, state, robot_pos in available_robots:
+		# Epsilon-greedy selection
+		if random.random() < EPSILON:
+			# Explore: random selection (already selected above)
+			print(f"[Q-LEARN] 🎲 EXPLORE: Random robot {robot_id} for {issue_type}")
+		else:
+			# Exploit: use Q-table (but we already selected, just log it)
+			with Q_table_lock:
+				q_value = Q_table[state].get(robot_id, 0.0)
+			print(f"[Q-LEARN] 🎯 EXPLOIT: Robot {robot_id} for {issue_type} (Q={q_value:.2f})")
+		
+		selected.append((robot_id, robot_ip, state))
+	
+	return selected
+
+def update_q_table(robot_id: str, state: tuple, reward: float):
+	"""Update Q-table with observed reward (completion time)"""
+	with Q_table_lock:
+		old_q = Q_table[state][robot_id]
+		# Simple Q-update (no next state since task ends)
+		Q_table[state][robot_id] = old_q + ALPHA * (reward - old_q)
+		new_q = Q_table[state][robot_id]
+		print(f"[Q-LEARN] 📊 Updated Q[{state}][{robot_id}]: {old_q:.2f} → {new_q:.2f} (reward={reward:.2f})")
+	
+	# Save Q-table periodically
+	if random.random() < 0.1:  # 10% chance to save
+		save_q_table()
+
+# Load Q-table on startup
+load_q_table()
+# ==================== END Q-LEARNING ====================
+MAX_COMMAND_LOGS = 200
 
 app = Flask(__name__)
 flask_cors.CORS(app)
@@ -180,11 +320,30 @@ def handle_tcp_client(client_sock, client_ip):
                             content = msg.get('content', {})
                             qr_code = content.get('qr_code')
                             api_data = content.get('api_data', {})
-                            issue_type = QR_CODE_TO_ISSUE.get(qr_code)
+                            issue_type = content.get('issue_type')
+                            coordinates = content.get('coordinates', {})
                             
-                            if issue_type and issue_type in ISSUE_LOCATIONS:
-                                issue_info = ISSUE_LOCATIONS[issue_type]
-                                coordinates = issue_info["coordinates"]
+                            # Store detected issue with actual coordinates from drone (skip duplicates)
+                            if issue_type and coordinates:
+                                issue_key = f"{issue_type}_{coordinates.get('x', 0)}_{coordinates.get('y', 0)}_{coordinates.get('z', 0)}"
+                                
+                                with issues_lock:
+                                    if issue_key in detected_issues:
+                                        print(f"[ISSUE] ⚠️ Duplicate issue ignored: {issue_type} at {coordinates} (already exists)")
+                                    else:
+                                        detected_issues[issue_key] = {
+                                            "issue_type": issue_type,
+                                            "coordinates": coordinates,
+                                            "timestamp": time.time(),
+                                            "drone_id": sender_id,
+                                            "api_data": api_data
+                                        }
+                                        print(f"[ISSUE] ✓ Stored NEW issue: {issue_type} at coordinates {coordinates}")
+                                        print(f"[ISSUE] Total issues in system: {len(detected_issues)}")
+                            else:
+                                print(f"[ISSUE] ✗ Missing issue_type or coordinates - issue_type={issue_type}, coordinates={coordinates}")
+                            
+                            if issue_type:
                                 
                                 print(f"\n[DETECTION] ╔════════════════════════════════════════════════════════════╗")
                                 print(f"[DETECTION] ║ QR CODE SCANNED BY DRONE                                      ║")
@@ -220,6 +379,28 @@ def handle_tcp_client(client_sock, client_ip):
                                     freed = True
                                     print(f"[TASK] ✓ Task completed by {dev_id} (status={status}, task_id={task_id})")
                                     print(f"[TASK] ✓ Robot is now available for new assignments")
+                                    
+                                    # Q-LEARNING: Calculate reward and update Q-table
+                                    with tasks_lock:
+                                        if task_id in active_tasks:
+                                            task_info = active_tasks[task_id]
+                                            completion_time = time.time() - task_info["assigned_at"]
+                                            reward = -completion_time  # Negative time (faster = higher reward)
+                                            
+                                            print(f"[Q-LEARN] Task {task_id} completed in {completion_time:.2f}s")
+                                            update_q_table(task_info["robot_id"], task_info["state"], reward)
+                                            
+                                            del active_tasks[task_id]
+                                    
+                                    # Remove the issue from detected_issues
+                                    if issue_type and coordinates:
+                                        issue_key = f"{issue_type}_{coordinates.get('x', 0)}_{coordinates.get('y', 0)}_{coordinates.get('z', 0)}"
+                                        with issues_lock:
+                                            if issue_key in detected_issues:
+                                                del detected_issues[issue_key]
+                                                print(f"[ISSUE] Removed resolved issue: {issue_type} at {coordinates}")
+                                    # Attempt to dispatch any queued issues now that a robot freed up
+                                    process_issue_queue()
                                     break
 
                             if not freed:
@@ -284,7 +465,7 @@ def handle_tcp_client(client_sock, client_ip):
 
 
 def udp_listener():
-    """UDP listener on port 8888 - catches broadcast signals"""
+    """UDP listener on port 8888 - catches broadcast signals and position updates"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -302,6 +483,30 @@ def udp_listener():
                 message_type = msg.get('message_type')
                 reply_tcp_port = msg.get('reply_tcp_port', TCP_ROBOT_PORT)
                 device_type = msg.get('device_type', 'unknown')
+
+                # Handle POSITION_UPDATE without logging
+                if message_type == "POSITION_UPDATE":
+                    with devices_lock:
+                        updated = False
+                        # Try matching by device_id first, then by IP
+                        if device_id and device_id in devices:
+                            devices[device_id]["position"] = position
+                            devices[device_id]["updated_at"] = time.time()
+                            print(f"[POSITION] Updated {device_id} position: {position}")
+                            updated = True
+                        else:
+                            # Fallback to IP matching
+                            for dev_id, dev in devices.items():
+                                if dev.get("ip") == device_ip:
+                                    dev["position"] = position
+                                    dev["updated_at"] = time.time()
+                                    print(f"[POSITION] Updated {dev_id} position: {position}")
+                                    updated = True
+                                    break
+                        
+                        if not updated:
+                            print(f"[POSITION] ⚠️ No device found for position update (device_id={device_id}, ip={device_ip})")
+                    continue  # Skip logging for position updates
 
                 log_packet(
                     direction="in",
@@ -344,6 +549,15 @@ def udp_listener():
                         "device_type": device_type,
                         "updated_at": time.time()
                     }
+
+                    # If a robot just joined, try to dispatch queued issues immediately
+                    if device_type.lower() == "robot":
+                        print(f"[QUEUE] New robot {device_id} joined. Attempting to dispatch pending issues...")
+                        try:
+                            process_issue_queue()
+                        except Exception as e:
+                            print(f"[QUEUE] Error while processing queue on robot join: {e}")
+
                 elif message_type == "HEARTBEAT":
                     # Update device based on sender_ip since heartbeat may not include device_id
                     updated = False
@@ -567,9 +781,68 @@ def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, issue
         return False, None
 
 
+def enqueue_issue(issue_key: str, issue_type: str, coordinates: dict, api_data: dict, robot_count: int):
+    """Add issue to pending queue if not already queued."""
+    with pending_lock:
+        for item in pending_issues:
+            if item.get("issue_key") == issue_key:
+                print(f"[QUEUE] Issue already in queue: {issue_key}")
+                return
+        pending_issues.append({
+            "issue_key": issue_key,
+            "issue_type": issue_type,
+            "coordinates": coordinates,
+            "api_data": api_data,
+            "robot_count": robot_count,
+            "enqueued_at": time.time()
+        })
+        print(f"[QUEUE] Enqueued issue {issue_key}. Queue size: {len(pending_issues)}")
+
+
+def process_issue_queue():
+    """Try to dispatch queued issues when robots become available."""
+    while True:
+        with pending_lock:
+            if not pending_issues:
+                return
+            issue = pending_issues[0]
+        issue_type = issue.get("issue_type")
+        coords = issue.get("coordinates", {})
+        api_data = issue.get("api_data", {})
+        robot_count = issue.get("robot_count", 1)
+        issue_key = issue.get("issue_key")
+
+        available = find_available_robots(robot_count)
+        if len(available) < robot_count:
+            print(f"[QUEUE] Not enough robots for {issue_key}. Needed {robot_count}, found {len(available)}. Will retry later.")
+            return
+
+        print(f"[QUEUE] Dispatching queued issue {issue_key} to {robot_count} robot(s)")
+        success_all = True
+        for idx, (robot_id, robot_ip) in enumerate(available[:robot_count], 1):
+            print(f"[QUEUE] → Assigning queued issue to robot {idx}/{robot_count}: {robot_id}")
+            success, message_id = send_movement_command(robot_id, robot_ip, coords, issue_type)
+            if not success:
+                success_all = False
+                print(f"[QUEUE] ✗ Failed to send queued issue {issue_key} to {robot_id}")
+                break
+            else:
+                print(f"[QUEUE] ✓ Sent queued issue {issue_key} to {robot_id} (msg_id={message_id})")
+
+        if success_all:
+            with pending_lock:
+                if pending_issues and pending_issues[0].get("issue_key") == issue_key:
+                    pending_issues.popleft()
+                    print(f"[QUEUE] ✓ Dequeued issue {issue_key}. Remaining: {len(pending_issues)}")
+        else:
+            # Stop processing to avoid skipping order
+            return
+
+
 def handle_issue_detection(issue_type: str, coordinates: dict, api_data: dict = None):
     """
-    Handle detection of a specific issue type and assign robots accordingly
+    Handle detection of a specific issue type and assign robots accordingly.
+    Uses drone-provided coordinates for robot assignment.
     - rust: 1 robot
     - overheated_circuit: 2 robots
     - tilted_antenna: 1 robot
@@ -578,36 +851,51 @@ def handle_issue_detection(issue_type: str, coordinates: dict, api_data: dict = 
         print(f"[ASSIGNMENT] ✗ Unknown issue type: {issue_type}")
         return False
     
+    # Get robot count from ISSUE_LOCATIONS, but use drone-provided coordinates
     issue_info = ISSUE_LOCATIONS[issue_type]
     robot_count = issue_info["robot_count"]
+    issue_key = f"{issue_type}_{coordinates.get('x', 0)}_{coordinates.get('y', 0)}_{coordinates.get('z', 0)}"
+        # Use coordinates from drone (not from ISSUE_LOCATIONS)
     
     print(f"\n[ASSIGNMENT] ╔════════════════════════════════════════════════════════════╗")
     print(f"[ASSIGNMENT] ║ ROBOT ASSIGNMENT INITIATED                              ║")
     print(f"[ASSIGNMENT] ║ Issue Type: {issue_type.upper():<43} ║")
     print(f"[ASSIGNMENT] ║ Required Robots: {robot_count:<45} ║")
-    print(f"[ASSIGNMENT] ║ Location: ({coordinates.get('x', 0)}, {coordinates.get('y', 0)}, {coordinates.get('z', 0):<25}) ║")
+    print(f"[ASSIGNMENT] ║ Drone-Detected Location: X={coordinates.get('x', 0)}, Y={coordinates.get('y', 0)}, Z={coordinates.get('z', 0):<15} ║")
     if api_data:
         print(f"[ASSIGNMENT] ║ API Data: {str(api_data):<49} ║")
     print(f"[ASSIGNMENT] ╚════════════════════════════════════════════════════════════╝\n")
     
-    # Find available robots
-    available_robots = find_available_robots(robot_count)
-    
-    if not available_robots:
-        print(f"[ASSIGNMENT] ⚠️  WARNING: No available robots for {issue_type.upper()} detection")
-        print(f"[ASSIGNMENT] Available robots needed: {robot_count}, Found: 0\n")
+    # Use Q-learning to select robots
+    print(f"[Q-LEARN] Using Q-learning for robot selection...")
+    selected_robots = smart_select_robot(issue_type, coordinates, robot_count)
+
+    if len(selected_robots) < robot_count:
+        print(f"[ASSIGNMENT] ⚠️  No available robots for {issue_type.upper()} (need {robot_count}, have {len(selected_robots)})")
+        enqueue_issue(issue_key, issue_type, coordinates, api_data or {}, robot_count)
         return False
+
+    print(f"[ASSIGNMENT] ✓ Found {len(selected_robots)} available robot(s)")
     
-    print(f"[ASSIGNMENT] ✓ Found {len(available_robots)} available robot(s)")
-    
-    # Send movement command to each robot
-    for idx, (robot_id, robot_ip) in enumerate(available_robots, 1):
-        print(f"[ASSIGNMENT] → Assigning Robot {idx}/{len(available_robots)}: {robot_id} at {robot_ip}")
+    # Send movement command to each robot with DRONE-PROVIDED coordinates
+    for idx, (robot_id, robot_ip, state) in enumerate(selected_robots, 1):
+        print(f"[ASSIGNMENT] → Assigning Robot {idx}/{len(selected_robots)}: {robot_id} at {robot_ip}")
+        print(f"[ASSIGNMENT]   Target location: X={coordinates.get('x')}, Y={coordinates.get('y')}, Z={coordinates.get('z')} (from drone)")
+        print(f"[ASSIGNMENT]   State: {state}")
         success, message_id = send_movement_command(robot_id, robot_ip, coordinates, issue_type)
         if not success:
             print(f"[ASSIGNMENT] ✗ Failed to assign robot {robot_id} for {issue_type.upper()} detection")
         else:
             print(f"[ASSIGNMENT] ✓ Successfully assigned robot {robot_id} (Message ID: {message_id})")
+            
+            # Track task for Q-learning reward calculation
+            with tasks_lock:
+                active_tasks[message_id] = {
+                    "robot_id": robot_id,
+                    "issue_type": issue_type,
+                    "state": state,
+                    "assigned_at": time.time()
+                }
     
     print(f"[ASSIGNMENT] ═════════════════════════════════════════════════════════════\n")
     return True
@@ -702,6 +990,47 @@ def api_clear_logs():
     with logs_lock:
         network_logs.clear()
     return jsonify({"success": True, "message": "logs cleared"})
+
+
+@app.route("/api/current-issues", methods=["GET"])
+def api_current_issues():
+    """Get all currently detected issues with their locations"""
+    with issues_lock:
+        issues = list(detected_issues.values())
+    
+    print(f"[API] /api/current-issues called - returning {len(issues)} issues")
+    if issues:
+        print(f"[API] Issues data: {issues}")
+    
+    return jsonify({
+        "success": True,
+        "issues": issues,
+        "count": len(issues),
+        "timestamp": time.time()
+    })
+
+
+@app.route("/api/devices-positions", methods=["GET"])
+def api_devices_positions():
+    """Get current positions of all devices"""
+    with devices_lock:
+        positions = {}
+        for dev_id, dev in devices.items():
+            positions[dev_id] = {
+                "device_id": dev_id,
+                "device_type": dev.get("device_type", "unknown"),
+                "position": dev.get("position"),
+                "ip": dev.get("ip"),
+                "status": dev.get("status"),
+                "updated_at": dev.get("updated_at"),
+                "task_id": dev.get("task_id")
+            }
+    
+    return jsonify({
+        "success": True,
+        "devices": positions,
+        "timestamp": time.time()
+    })
 
 
 @app.route("/api/send-broadcast", methods=["POST"])
@@ -839,6 +1168,48 @@ def api_circuit_overheat_location():
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/command-logs", methods=["GET"])
+def get_command_logs():
+    """Return recent command logs for drone/robot control"""
+    with command_logs_lock:
+        # Return logs in reverse chronological order (newest first)
+        return jsonify({
+            "success": True,
+            "commands": list(reversed(command_logs))
+        })
+
+
+@app.route("/api/log-command", methods=["POST"])
+def log_command():
+    """Log a drone/robot control command"""
+    data = request.get_json()
+    
+    device_id = data.get("device_id")
+    command = data.get("command")
+    device_type = data.get("device_type", "drone")
+    
+    if not device_id or not command:
+        return jsonify({"success": False, "error": "Missing device_id or command"}), 400
+    
+    log_entry = {
+        "device_id": device_id,
+        "device_type": device_type,
+        "command": command,
+        "base_station_ip": BASE_STATION_IP,
+        "timestamp": time.time()
+    }
+    
+    with command_logs_lock:
+        command_logs.append(log_entry)
+        # Keep only the most recent commands
+        if len(command_logs) > MAX_COMMAND_LOGS:
+            del command_logs[:-MAX_COMMAND_LOGS]
+    
+    print(f"[COMMAND LOG] {device_type.upper()} {device_id}: {command} from {BASE_STATION_IP}")
+    
+    return jsonify({"success": True, "logged": log_entry})
 
 
 if __name__ == "__main__":

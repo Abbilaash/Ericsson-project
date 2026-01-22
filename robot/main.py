@@ -4,12 +4,17 @@ import json
 import threading
 import logging
 import os
+import serial
 
 
 UDP_SERVER_PORT = 8888 
 TCP_ACK_PORT = 9999          # Port for receiving ACK from base station
 BASE_STATION_TCP_PORT = 9998  # Port for sending messages TO base station
 HEARTBEAT_INTERVAL_SEC = 60
+POSITION_UPDATE_INTERVAL_SEC = 5
+
+# Robot position (simulated - in real scenario would come from sensors/localization)
+robot_position = {"x": 100.0, "y": 120.0, "z": 5.0}
 
 # Issue types handled by this robot
 ISSUE_TYPES = {
@@ -18,11 +23,97 @@ ISSUE_TYPES = {
 	"tilted_antenna": "robot_task"
 }
 
+# Arduino Serial Configuration
+ARDUINO_PORT = '/dev/ttyUSB0'  # Change to ttyACM0 if needed
+ARDUINO_BAUD_RATE = 9600
+arduino_serial = None  # Global serial connection
+arduino_lock = threading.Lock()
+
 
 logging.basicConfig(
 	level=logging.INFO,
 	format="[%(asctime)s] %(levelname)s: %(message)s",
 )
+
+
+def init_arduino_connection():
+	"""Initialize serial connection to Arduino"""
+	global arduino_serial
+	try:
+		arduino_serial = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD_RATE, timeout=1)
+		logging.info(f"[ARDUINO] ✓ Connected to Arduino on {ARDUINO_PORT} at {ARDUINO_BAUD_RATE} baud")
+		# Wait for Arduino boot-up reset
+		time.sleep(2)
+		logging.info("[ARDUINO] ✓ Arduino initialization complete")
+		return True
+	except serial.SerialException as e:
+		logging.error(f"[ARDUINO] ✗ Failed to connect to Arduino: {e}")
+		logging.warning(f"[ARDUINO] Verify that {ARDUINO_PORT} is the correct port")
+		return False
+	except Exception as e:
+		logging.error(f"[ARDUINO] ✗ Unexpected error: {e}")
+		return False
+
+
+def send_arduino_signal(signal: str, duration_sec: float = 3.0) -> bool:
+	"""Send a signal character to Arduino for specified duration"""
+	global arduino_serial
+	
+	if not arduino_serial:
+		logging.warning("[ARDUINO] Serial connection not initialized")
+		return False
+	
+	try:
+		# Format: send signal with newline
+		command = f"{signal}\n"
+		start_time = time.time()
+		
+		with arduino_lock:
+			logging.info(f"[ARDUINO] → Sending signal '{signal}' for {duration_sec}s")
+			while time.time() - start_time < duration_sec:
+				arduino_serial.write(command.encode('utf-8'))
+				time.sleep(0.5)  # Send signal every 0.5 seconds
+			
+			logging.info(f"[ARDUINO] ✓ Signal '{signal}' sent for {duration_sec}s")
+			return True
+		
+	except Exception as e:
+		logging.error(f"[ARDUINO] ✗ Error sending signal: {e}")
+		return False
+
+
+def send_coordinates_to_arduino(coordinates: dict) -> bool:
+	"""Send coordinates to Arduino via serial"""
+	global arduino_serial
+	
+	if not arduino_serial:
+		logging.warning("[ARDUINO] Serial connection not initialized")
+		return False
+	
+	try:
+		x = int(coordinates.get('x', 0))
+		y = int(coordinates.get('y', 0))
+		z = int(coordinates.get('z', 0)) 
+		
+		# Format: "X50,Y75,Z10\n" - send as string with newline
+		command = f"X{x},Y{y},Z{z}\n"
+		
+		with arduino_lock:
+			logging.info(f"[ARDUINO] → Sending coordinates: {command.strip()}")
+			arduino_serial.write(command.encode('utf-8'))
+			time.sleep(0.1)  # Small delay for Arduino to process
+			
+			response = arduino_serial.readline().decode('utf-8', errors='ignore').strip()
+			if response:
+				logging.info(f"[ARDUINO] ✓ Arduino responded: {response}")
+				return True
+			else:
+				logging.warning("[ARDUINO] No response from Arduino, but command sent")
+				return True
+		
+	except Exception as e:
+		logging.error(f"[ARDUINO] ✗ Error sending coordinates: {e}")
+		return False
 
 
 def get_local_ip() -> str:
@@ -44,6 +135,36 @@ message_sender_lock = threading.Lock()
 # Current task/movement
 current_task = None
 task_lock = threading.Lock()
+
+# Movement parameters
+MOVEMENT_SPEED = 2.0  # units per second
+MOVEMENT_UPDATE_INTERVAL = 0.5  # update position every 0.5 seconds
+
+def calculate_distance(pos1: dict, pos2: dict) -> float:
+	"""Calculate 2D distance between two positions"""
+	import math
+	dx = pos2['x'] - pos1['x']
+	dy = pos2['y'] - pos1['y']
+	return math.sqrt(dx*dx + dy*dy)
+
+def move_towards_target(current: dict, target: dict, speed: float, dt: float) -> dict:
+	"""Move robot towards target position at given speed"""
+	import math
+	dx = target['x'] - current['x']
+	dy = target['y'] - current['y']
+	distance = math.sqrt(dx*dx + dy*dy)
+	
+	if distance < speed * dt:
+		# Arrived at target
+		return {"x": target['x'], "y": target['y'], "z": target['z']}
+	else:
+		# Move towards target
+		ratio = (speed * dt) / distance
+		return {
+			"x": current['x'] + dx * ratio,
+			"y": current['y'] + dy * ratio,
+			"z": current['z']  # Keep z constant during horizontal movement
+		}
 
 def broadcast_join(reply_tcp_port: int = TCP_ACK_PORT) -> None:
 	timestamp = time.time()
@@ -180,6 +301,35 @@ def send_heartbeat(base_station_ip: str, stop_event: threading.Event | None = No
 			time.sleep(HEARTBEAT_INTERVAL_SEC)
 
 
+def send_position_update(base_station_ip: str, stop_event: threading.Event) -> None:
+	"""Send position updates to base station every 5 seconds (no logging in dashboard)"""
+	sender_ip = get_local_ip()
+	
+	with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+		while True:
+			if stop_event and stop_event.is_set():
+				logging.info("[POSITION] Position updates stopped")
+				return
+			
+			try:
+				# Simulate robot movement (optional - you can implement actual position tracking)
+				# For now, we'll send fixed position
+				payload = {
+					"message_type": "POSITION_UPDATE",
+					"device_id": device_id,
+					"device_type": "robot",
+					"sender_ip": sender_ip,
+					"position": robot_position
+				}
+				data = json.dumps(payload).encode("utf-8")
+				sock.sendto(data, (base_station_ip, UDP_SERVER_PORT))
+				logging.debug(f"[POSITION] Sent position update: {robot_position}")
+			except OSError as e:
+				logging.error(f"[POSITION] Failed to send position update: {e}")
+			
+			time.sleep(POSITION_UPDATE_INTERVAL_SEC)
+
+
 def send_message_to_base_station(base_station_ip: str, message_type: str, content: dict):
 	"""
 	Send a message to the base station via persistent TCP connection (newline-delimited JSON)
@@ -299,15 +449,43 @@ def handle_movement_command(msg: dict, base_station_ip: str = None):
 	# Perform the movement and rectification
 	if command == "move_to_location":
 		try:
-			# Step 1: Move to location
+			# Step 1: Send 'F' signal to Arduino for 3 seconds when task received
+			logging.info(f"[MOVEMENT] → Sending 'F' signal to Arduino for task activation")
+			send_arduino_signal('F', duration_sec=3.0)
+			
+			# Step 2: Send coordinates to Arduino
+			logging.info(f"[MOVEMENT] → Sending coordinates to Arduino: {coordinates}")
+			arduino_success = send_coordinates_to_arduino(coordinates)
+			
+			if not arduino_success:
+				logging.warning("[MOVEMENT] ⚠️  Arduino communication failed, but continuing with simulation")
+			else:
+				logging.info("[MOVEMENT] ✓ Arduino acknowledged coordinates")
+			
+			# Step 3: Move to location with real-time position updates
+			global robot_position
 			logging.info(f"[MOVEMENT] → Moving to coordinates: {coordinates}")
 			logging.info(f"[MOVEMENT] → Motor control: Activating movement...")
-			# TODO: Replace with actual motor control code
-			# e.g., motor_controller.move_to(coordinates['x'], coordinates['y'], coordinates['z'])
-			time.sleep(3)  # Simulate travel time
-			logging.info(f"[MOVEMENT] ✓ Arrived at location")
 			
-			# Step 2: Rectify the issue
+			# Calculate initial distance
+			initial_distance = calculate_distance(robot_position, coordinates)
+			logging.info(f"[MOVEMENT] Distance to target: {initial_distance:.2f} units")
+			
+			# Move towards target with position updates (visible in 2D map)
+			while True:
+				distance = calculate_distance(robot_position, coordinates)
+				if distance < 0.5:  # Close enough to target
+					robot_position = {"x": coordinates['x'], "y": coordinates['y'], "z": coordinates['z']}
+					break
+				
+				# Update position towards target
+				robot_position = move_towards_target(robot_position, coordinates, MOVEMENT_SPEED, MOVEMENT_UPDATE_INTERVAL)
+				logging.info(f"[MOVEMENT] Current position: ({robot_position['x']:.1f}, {robot_position['y']:.1f}) - Distance remaining: {distance:.1f}")
+				time.sleep(MOVEMENT_UPDATE_INTERVAL)
+			
+			logging.info(f"[MOVEMENT] ✓ Arrived at location ({robot_position['x']}, {robot_position['y']})")
+			
+			# Step 4: Rectify the issue
 			logging.info(f"[MOVEMENT] → Starting issue rectification for {issue_type.upper()}")
 			logging.info(f"[MOVEMENT] → Activating remediation mechanism...")
 			# TODO: Replace with actual rectification mechanism
@@ -315,13 +493,13 @@ def handle_movement_command(msg: dict, base_station_ip: str = None):
 			time.sleep(2)  # Simulate remediation time
 			logging.info(f"[MOVEMENT] ✓ Issue {issue_type.upper()} rectified successfully")
 			
-			# Step 3: Update task status
+			# Step 5: Update task status
 			with task_lock:
 				if current_task:
 					current_task["status"] = "completed"
 					current_task["completed_at"] = time.time()
 			
-			# Step 4: Report completion back to base station
+			# Step 6: Report completion back to base station
 			if base_station_ip:
 				completion_report = {
 					"task_id": message_id,
@@ -357,12 +535,24 @@ def handle_movement_command(msg: dict, base_station_ip: str = None):
 
 def cleanup_connections():
 	"""Close persistent connections on shutdown"""
-	global message_sender_socket
+	global message_sender_socket, arduino_serial
+	
+	# Close Arduino connection
+	with arduino_lock:
+		if arduino_serial:
+			try:
+				arduino_serial.close()
+				logging.info("[CLEANUP] ✓ Closed Arduino serial connection")
+			except:
+				pass
+			arduino_serial = None
+	
+	# Close base station connection
 	with message_sender_lock:
 		if message_sender_socket:
 			try:
 				message_sender_socket.close()
-				logging.info("[CLEANUP] Closed persistent connection to base station")
+				logging.info("[CLEANUP] ✓ Closed persistent connection to base station")
 			except:
 				pass
 			message_sender_socket = None
@@ -441,6 +631,11 @@ def receive_messages(stop_event: threading.Event, base_station_ip: str = None) -
 
 
 def main():
+	# Initialize Arduino connection first
+	logging.info("[MAIN] Initializing Arduino connection...")
+	if not init_arduino_connection():
+		logging.warning("[MAIN] ⚠️  Arduino connection failed; robot will work without Arduino")
+	
 	broadcast_join(reply_tcp_port=TCP_ACK_PORT)
 	base_ip = wait_for_tcp_ack(listen_port=TCP_ACK_PORT, timeout_sec=120)
 	if not base_ip:
@@ -454,6 +649,10 @@ def main():
 	hb_thread = threading.Thread(target=send_heartbeat, args=(base_ip, stop_event), daemon=True)
 	hb_thread.start()
 	
+	# Start position update thread
+	pos_thread = threading.Thread(target=send_position_update, args=(base_ip, stop_event), daemon=True)
+	pos_thread.start()
+	
 	# Start message receiver thread with base_ip for task completion reporting
 	msg_thread = threading.Thread(target=receive_messages, args=(stop_event, base_ip), daemon=True)
 	msg_thread.start()
@@ -466,6 +665,7 @@ def main():
 		stop_event.set()
 		cleanup_connections()
 		hb_thread.join(timeout=5)
+		pos_thread.join(timeout=5)
 		msg_thread.join(timeout=5)
 
 

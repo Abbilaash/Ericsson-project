@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';import TowerVisualization from '../components/TowerVisualization';
+import { useState, useEffect } from 'react';
+import IssueMap2D from '../components/IssueMap2D';
 import './Dashboard.css';
 
 const API_BASE = 'http://localhost:5000';
@@ -252,6 +253,17 @@ function Dashboard() {
       
       const data = await response.json();
       if (data.success) {
+        // Log the command to backend
+        await fetch(`${API_BASE}/api/log-command`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            device_id: deviceId,
+            device_type: deviceType,
+            command: 'ENGAGE'
+          })
+        }).catch(err => console.error('Failed to log command:', err));
+        
         alert(`Engage command sent to ${deviceId}`);
       } else {
         alert(`Error: ${data.error}`);
@@ -279,6 +291,17 @@ function Dashboard() {
       
       const data = await response.json();
       if (data.success) {
+        // Log the command to backend
+        await fetch(`${API_BASE}/api/log-command`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            device_id: deviceId,
+            device_type: deviceType,
+            command: 'GROUND'
+          })
+        }).catch(err => console.error('Failed to log command:', err));
+        
         alert(`Ground command sent to ${deviceId}`);
       } else {
         alert(`Error: ${data.error}`);
@@ -555,8 +578,8 @@ function Dashboard() {
           </div>
         </div>
       <div className="panel tower-panel">
-        <h2>Tower Visualization</h2>
-        <TowerVisualization drones={drones} robots={robots} />
+        <h2>Operations Map</h2>
+        <IssueMap2D drones={drones} robots={robots} />
       </div>
     </div>
     </div>

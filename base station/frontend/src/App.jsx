@@ -2,6 +2,7 @@ import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react
 import Status from './pages/Status';
 import Operations from './pages/Operations';
 import Logs from './pages/Logs';
+import CommandLogs from './pages/CommandLogs';
 import './App.css';
 
 function Navigation() {
@@ -29,6 +30,12 @@ function Navigation() {
         >
           Logs
         </Link>
+        <Link
+          to="/command-logs"
+          className={location.pathname === '/command-logs' ? 'nav-link active' : 'nav-link'}
+        >
+          Commands
+        </Link>
       </div>
     </nav>
   );
@@ -43,6 +50,7 @@ function App() {
           <Route path="/" element={<Status />} />
           <Route path="/operations" element={<Operations />} />
           <Route path="/logs" element={<Logs />} />
+          <Route path="/command-logs" element={<CommandLogs />} />
         </Routes>
       </div>
     </Router>

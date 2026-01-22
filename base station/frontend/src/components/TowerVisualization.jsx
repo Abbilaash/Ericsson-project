@@ -68,6 +68,25 @@ function TowerVisualization({ drones, robots }) {
     gridHelper.position.y = 0.01;
     scene.add(gridHelper);
 
+    // Draw tower boundary (trace actual tower base outline - 8-sided octagon)
+    const towerBaseRadius = 3;  // Bottom radius of tower
+    const towerSegments = 8;    // Same as tower geometry
+    const boundaryPoints = [];
+    for (let i = 0; i <= towerSegments; i++) {
+      const angle = (i / towerSegments) * Math.PI * 2;
+      boundaryPoints.push(
+        new THREE.Vector3(
+          towerBaseRadius * Math.cos(angle),
+          0.05,  // Just above ground
+          towerBaseRadius * Math.sin(angle)
+        )
+      );
+    }
+    const boundaryGeometry = new THREE.BufferGeometry().setFromPoints(boundaryPoints);
+    const boundaryMaterial = new THREE.LineBasicMaterial({ color: 0xe2e8f0, linewidth: 3 });
+    const boundaryLine = new THREE.Line(boundaryGeometry, boundaryMaterial);
+    scene.add(boundaryLine);
+
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
 

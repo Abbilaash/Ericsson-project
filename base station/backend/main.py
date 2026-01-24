@@ -61,6 +61,13 @@ network_logs = []
 logs_lock = threading.Lock()
 MAX_LOGS = 500
 
+# Ensure only one dispatcher runs at a time to prevent over-assignment
+dispatch_lock = threading.Lock()
+
+# Throttle noisy position logs
+POSITION_LOG_INTERVAL = 5  # seconds
+last_position_log = defaultdict(float)
+
 # Track detected issues with their locations and status
 detected_issues = {}  # Format: {issue_key: {"issue_type": "...", "coordinates": {...}, "timestamp": ..., "drone_id": "..."}}
 issues_lock = threading.Lock()
@@ -69,132 +76,16 @@ issues_lock = threading.Lock()
 pending_issues = deque()  # Each item: {issue_key, issue_type, coordinates, api_data, robot_count, enqueued_at}
 pending_lock = threading.Lock()
 
+# Track which robots have been assigned to which issues (prevent duplicate assignments)
+issue_assignments = {}  # Format: {issue_key: [robot_id1, robot_id2, ...]}
+assignments_lock = threading.Lock()
+
 # Command logs for tracking drone/robot control commands
 command_logs = []  # Format: {drone_id, command, base_station_ip, timestamp}
 command_logs_lock = threading.Lock()
 
-# ==================== Q-LEARNING ROBOT SELECTION ====================
-# Q-learning parameters
-ALPHA = 0.1          # Learning rate
-GAMMA = 0.9          # Discount factor (not used in single-step reward)
-EPSILON = 0.15       # Exploration rate (15% random selection)
-
-# Q-table: Q[(state, action)] = expected reward
-# State: (issue_type, distance_bucket, robot_availability)
-# Action: robot_id
-Q_table = defaultdict(lambda: defaultdict(float))  # Q[state][robot_id] = value
-Q_table_lock = threading.Lock()
-
-# Track task assignments for reward calculation
-active_tasks = {}  # task_id -> {robot_id, issue_type, distance, assigned_at}
-tasks_lock = threading.Lock()
-
-# Q-table persistence
-Q_TABLE_FILE = "q_table.pkl"
-
-def load_q_table():
-	"""Load Q-table from disk if exists"""
-	global Q_table
-	if os.path.exists(Q_TABLE_FILE):
-		try:
-			with open(Q_TABLE_FILE, 'rb') as f:
-				Q_table = pickle.load(f)
-			print(f"[Q-LEARN] ✓ Loaded Q-table with {len(Q_table)} states")
-		except Exception as e:
-			print(f"[Q-LEARN] ⚠ Failed to load Q-table: {e}")
-
-def save_q_table():
-	"""Save Q-table to disk"""
-	try:
-		with Q_table_lock:
-			with open(Q_TABLE_FILE, 'wb') as f:
-				pickle.dump(dict(Q_table), f)
-			print(f"[Q-LEARN] ✓ Saved Q-table with {len(Q_table)} states")
-	except Exception as e:
-		print(f"[Q-LEARN] ⚠ Failed to save Q-table: {e}")
-
-def calculate_distance(pos1: dict, pos2: dict) -> float:
-	"""Calculate 2D distance between two positions"""
-	dx = pos2.get('x', 0) - pos1.get('x', 0)
-	dy = pos2.get('y', 0) - pos1.get('y', 0)
-	return math.sqrt(dx*dx + dy*dy)
-
-def get_distance_bucket(distance: float) -> str:
-	"""Convert distance to bucket for state representation"""
-	if distance < 30:
-		return "near"
-	elif distance < 60:
-		return "medium"
-	else:
-		return "far"
-
-def get_state(issue_type: str, robot_position: dict, issue_coordinates: dict) -> tuple:
-	"""Extract state for Q-learning"""
-	distance = calculate_distance(robot_position, issue_coordinates)
-	dist_bucket = get_distance_bucket(distance)
-	return (issue_type, dist_bucket)
-
-def smart_select_robot(issue_type: str, issue_coordinates: dict, required_count: int = 1):
-	"""
-	Select robots using Q-learning (epsilon-greedy)
-	Returns: list of (robot_id, robot_ip, state) tuples
-	"""
-	available_robots = []
-	
-	# Find all available robots with their positions
-	for dev_id, dev in devices.items():
-		if dev.get("device_type", "").lower() == "robot" and not dev.get("task_id"):
-			robot_pos = dev.get("position", {"x": 0, "y": 0, "z": 0})
-			# Parse position if it's a string
-			if isinstance(robot_pos, str):
-				import re
-				match = re.match(r'\(([^,]+),\s*([^,]+),\s*([^)]+)\)', robot_pos)
-				if match:
-					robot_pos = {"x": float(match.group(1)), "y": float(match.group(2)), "z": float(match.group(3))}
-				else:
-					robot_pos = {"x": 0, "y": 0, "z": 0}
-			
-			state = get_state(issue_type, robot_pos, issue_coordinates)
-			available_robots.append((dev_id, dev.get("ip"), state, robot_pos))
-	
-	if not available_robots:
-		return []
-	
-	# Limit to required count
-	available_robots = available_robots[:required_count]
-	selected = []
-	
-	for robot_id, robot_ip, state, robot_pos in available_robots:
-		# Epsilon-greedy selection
-		if random.random() < EPSILON:
-			# Explore: random selection (already selected above)
-			print(f"[Q-LEARN] 🎲 EXPLORE: Random robot {robot_id} for {issue_type}")
-		else:
-			# Exploit: use Q-table (but we already selected, just log it)
-			with Q_table_lock:
-				q_value = Q_table[state].get(robot_id, 0.0)
-			print(f"[Q-LEARN] 🎯 EXPLOIT: Robot {robot_id} for {issue_type} (Q={q_value:.2f})")
-		
-		selected.append((robot_id, robot_ip, state))
-	
-	return selected
-
-def update_q_table(robot_id: str, state: tuple, reward: float):
-	"""Update Q-table with observed reward (completion time)"""
-	with Q_table_lock:
-		old_q = Q_table[state][robot_id]
-		# Simple Q-update (no next state since task ends)
-		Q_table[state][robot_id] = old_q + ALPHA * (reward - old_q)
-		new_q = Q_table[state][robot_id]
-		print(f"[Q-LEARN] 📊 Updated Q[{state}][{robot_id}]: {old_q:.2f} → {new_q:.2f} (reward={reward:.2f})")
-	
-	# Save Q-table periodically
-	if random.random() < 0.1:  # 10% chance to save
-		save_q_table()
-
-# Load Q-table on startup
-load_q_table()
-# ==================== END Q-LEARNING ====================
+# ==================== SIMPLE ROBOT SELECTION ====================
+# (see unified implementation further below)
 MAX_COMMAND_LOGS = 200
 
 app = Flask(__name__)
@@ -370,8 +261,30 @@ def handle_tcp_client(client_sock, client_ip):
                             message = content.get('message')
 
                             freed = False
-                            for dev_id, dev in devices.items():
-                                if dev_id == sender_id or dev.get("ip") == client_ip:
+                            # Prefer freeing by matching task_id to avoid freeing multiple robots by IP
+                            with devices_lock:
+                                # Find robot with this task_id
+                                target_robot_id = None
+                                for dev_id, dev in devices.items():
+                                    if dev.get("task_id") == task_id and dev.get("device_type", "").lower() == "robot":
+                                        target_robot_id = dev_id
+                                        break
+                                # Fallbacks if not found: sender_id, then IP (single match)
+                                candidates = []
+                                if target_robot_id:
+                                    candidates = [target_robot_id]
+                                elif sender_id in devices:
+                                    candidates = [sender_id]
+                                else:
+                                    for dev_id, dev in devices.items():
+                                        if dev.get("ip") == client_ip and dev.get("device_type", "").lower() == "robot":
+                                            candidates = [dev_id]
+                                            break
+
+                                for dev_id in candidates:
+                                    dev = devices.get(dev_id)
+                                    if not dev:
+                                        continue
                                     dev["task_id"] = None
                                     dev["current_task"] = None
                                     dev["status"] = "READY"
@@ -380,18 +293,6 @@ def handle_tcp_client(client_sock, client_ip):
                                     print(f"[TASK] ✓ Task completed by {dev_id} (status={status}, task_id={task_id})")
                                     print(f"[TASK] ✓ Robot is now available for new assignments")
                                     
-                                    # Q-LEARNING: Calculate reward and update Q-table
-                                    with tasks_lock:
-                                        if task_id in active_tasks:
-                                            task_info = active_tasks[task_id]
-                                            completion_time = time.time() - task_info["assigned_at"]
-                                            reward = -completion_time  # Negative time (faster = higher reward)
-                                            
-                                            print(f"[Q-LEARN] Task {task_id} completed in {completion_time:.2f}s")
-                                            update_q_table(task_info["robot_id"], task_info["state"], reward)
-                                            
-                                            del active_tasks[task_id]
-                                    
                                     # Remove the issue from detected_issues
                                     if issue_type and coordinates:
                                         issue_key = f"{issue_type}_{coordinates.get('x', 0)}_{coordinates.get('y', 0)}_{coordinates.get('z', 0)}"
@@ -399,9 +300,19 @@ def handle_tcp_client(client_sock, client_ip):
                                             if issue_key in detected_issues:
                                                 del detected_issues[issue_key]
                                                 print(f"[ISSUE] Removed resolved issue: {issue_type} at {coordinates}")
-                                    # Attempt to dispatch any queued issues now that a robot freed up
-                                    process_issue_queue()
-                                    break
+                                        # Also clean up assignment tracking for this robot
+                                        with assignments_lock:
+                                            if issue_key in issue_assignments:
+                                                if dev_id in issue_assignments[issue_key]:
+                                                    issue_assignments[issue_key].remove(dev_id)
+                                                    print(f"[TASK] Removed {dev_id} from assignment tracking for {issue_key}")
+                                                # If no more robots assigned to this issue, remove the entry
+                                                if not issue_assignments[issue_key]:
+                                                    del issue_assignments[issue_key]
+                                                    print(f"[TASK] Cleaned up assignment tracking for completed issue {issue_key}")
+                            # Attempt to dispatch any queued issues now that a robot freed up
+                            if freed:
+                                process_issue_queue()
 
                             if not freed:
                                 print(f"[TASK] ⚠ Received TASK_COMPLETED from unknown device {sender_id} / {client_ip}")
@@ -488,19 +399,24 @@ def udp_listener():
                 if message_type == "POSITION_UPDATE":
                     with devices_lock:
                         updated = False
+                        now = time.time()
                         # Try matching by device_id first, then by IP
                         if device_id and device_id in devices:
                             devices[device_id]["position"] = position
-                            devices[device_id]["updated_at"] = time.time()
-                            print(f"[POSITION] Updated {device_id} position: {position}")
+                            devices[device_id]["updated_at"] = now
+                            if now - last_position_log[device_id] >= POSITION_LOG_INTERVAL:
+                                print(f"[POSITION] Updated {device_id} position: {position}")
+                                last_position_log[device_id] = now
                             updated = True
                         else:
                             # Fallback to IP matching
                             for dev_id, dev in devices.items():
                                 if dev.get("ip") == device_ip:
                                     dev["position"] = position
-                                    dev["updated_at"] = time.time()
-                                    print(f"[POSITION] Updated {dev_id} position: {position}")
+                                    dev["updated_at"] = now
+                                    if now - last_position_log[dev_id] >= POSITION_LOG_INTERVAL:
+                                        print(f"[POSITION] Updated {dev_id} position: {position}")
+                                        last_position_log[dev_id] = now
                                     updated = True
                                     break
                         
@@ -691,22 +607,20 @@ def find_available_robots(count: int):
     Returns: list of (robot_id, robot_ip) tuples, may be less than count if not enough robots
     """
     available = []
-    print(f"[ROBOTS] Searching for {count} available robot(s)...")
-    print(f"[ROBOTS] Total devices in system: {len(devices)}")
-    
-    for dev_id, dev in devices.items():
-        device_type = dev.get("device_type", "").lower()
-        print(f"[ROBOTS] → Device: {dev_id}, Type: {device_type}, Has task_id: {bool(dev.get('task_id'))}")
-        
-        if device_type == "robot":
-            task_id = dev.get("task_id")
-            if not task_id:
-                available.append((dev_id, dev.get("ip")))
-                print(f"[ROBOTS] ✓ Found available robot: {dev_id}")
-                if len(available) >= count:
-                    break
-    
-    print(f"[ROBOTS] Found {len(available)}/{count} available robots\n")
+    total_robots = 0
+    with devices_lock:
+        for dev_id, dev in devices.items():
+            if dev.get("device_type", "").lower() == "robot":
+                total_robots += 1
+                task_id = dev.get("task_id")
+                status = dev.get("status", "UNKNOWN")
+                if not task_id:
+                    available.append((dev_id, dev.get("ip")))
+                    if len(available) >= count:
+                        break
+                else:
+                    print(f"[FIND] Robot {dev_id} busy: task_id={task_id}, status={status}")
+    print(f"[FIND] Total robots: {total_robots}, Available: {len(available)}, Requested: {count}")
     return available
 
 
@@ -755,17 +669,18 @@ def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, issue
                 payload=movement_msg,
             )
             
-            # Update the robot's task_id to the message_id
-            for dev_id, dev in devices.items():
-                if dev_id == robot_id or dev.get("ip") == robot_ip:
+            # Update ONLY the targeted robot's task state by ID (avoid IP collisions)
+            with devices_lock:
+                if robot_id in devices:
+                    dev = devices[robot_id]
                     dev["task_id"] = message_id
+                    dev["status"] = "BUSY"
                     dev["current_task"] = {
                         "issue_type": issue_type,
                         "coordinates": coordinates,
                         "assigned_at": time.time()
                     }
-                    print(f"[MOVEMENT] Updated {dev_id} task_id to {message_id}")
-                    break
+                    print(f"[MOVEMENT] Updated {robot_id} task_id to {message_id}")
             
             return True, message_id
     except socket.timeout:
@@ -800,43 +715,114 @@ def enqueue_issue(issue_key: str, issue_type: str, coordinates: dict, api_data: 
 
 
 def process_issue_queue():
-    """Try to dispatch queued issues when robots become available."""
-    while True:
-        with pending_lock:
-            if not pending_issues:
-                return
-            issue = pending_issues[0]
-        issue_type = issue.get("issue_type")
-        coords = issue.get("coordinates", {})
-        api_data = issue.get("api_data", {})
-        robot_count = issue.get("robot_count", 1)
-        issue_key = issue.get("issue_key")
-
-        available = find_available_robots(robot_count)
-        if len(available) < robot_count:
-            print(f"[QUEUE] Not enough robots for {issue_key}. Needed {robot_count}, found {len(available)}. Will retry later.")
-            return
-
-        print(f"[QUEUE] Dispatching queued issue {issue_key} to {robot_count} robot(s)")
-        success_all = True
-        for idx, (robot_id, robot_ip) in enumerate(available[:robot_count], 1):
-            print(f"[QUEUE] → Assigning queued issue to robot {idx}/{robot_count}: {robot_id}")
-            success, message_id = send_movement_command(robot_id, robot_ip, coords, issue_type)
-            if not success:
-                success_all = False
-                print(f"[QUEUE] ✗ Failed to send queued issue {issue_key} to {robot_id}")
-                break
-            else:
-                print(f"[QUEUE] ✓ Sent queued issue {issue_key} to {robot_id} (msg_id={message_id})")
-
-        if success_all:
+    """Try to dispatch queued issues when robots become available (FIFO)."""
+    dispatcher_id = f"D{int(time.time() * 1000000) % 10000}"
+    # Ensure only one dispatcher runs at a time
+    if not dispatch_lock.acquire(blocking=False):
+        print(f"[QUEUE:{dispatcher_id}] ⚠️  Dispatcher already running, skipping this call")
+        return
+    
+    print(f"[QUEUE:{dispatcher_id}] 🚀 Starting dispatch process...")
+    try:
+        while True:
+            # Atomically: get issue and remove any duplicates from queue
             with pending_lock:
-                if pending_issues and pending_issues[0].get("issue_key") == issue_key:
-                    pending_issues.popleft()
-                    print(f"[QUEUE] ✓ Dequeued issue {issue_key}. Remaining: {len(pending_issues)}")
-        else:
-            # Stop processing to avoid skipping order
-            return
+                if not pending_issues:
+                    print(f"[QUEUE:{dispatcher_id}] Queue empty, exiting dispatcher")
+                    return
+                
+                # Get the first issue
+                issue = pending_issues[0]
+                current_issue_key = issue.get("issue_key")
+                
+                # Look ahead and remove any duplicate issues (same location/type)
+                duplicates_removed = 0
+                i = 1
+                while i < len(pending_issues):
+                    if pending_issues[i].get("issue_key") == current_issue_key:
+                        print(f"[QUEUE:{dispatcher_id}] ⚠️  Found duplicate of {current_issue_key}, removing from queue")
+                        pending_issues.remove(pending_issues[i])
+                        duplicates_removed += 1
+                    else:
+                        i += 1
+                
+                if duplicates_removed > 0:
+                    print(f"[QUEUE:{dispatcher_id}] Removed {duplicates_removed} duplicate(s)")
+            
+            issue_type = issue.get("issue_type")
+            coords = issue.get("coordinates", {})
+            api_data = issue.get("api_data", {})
+            robot_count = issue.get("robot_count", 1)
+            issue_key = issue.get("issue_key")
+
+            print(f"[QUEUE:{dispatcher_id}] Processing issue {issue_key}, needs {robot_count} robot(s)")
+            print(f"[QUEUE:{dispatcher_id}] Searching for available robots...")
+            
+            # Get available robots (not already assigned to this issue)
+            available = find_available_robots(robot_count)
+            print(f"[QUEUE:{dispatcher_id}] Found {len(available)} available robot(s): {[r[0] for r in available]}")
+            
+            # Filter out robots already assigned to this issue
+            with assignments_lock:
+                already_assigned = issue_assignments.get(issue_key, [])
+                available = [(rid, rip) for rid, rip in available if rid not in already_assigned]
+                print(f"[QUEUE:{dispatcher_id}] After filtering, {len(available)} new robot(s) available: {[r[0] for r in available]}")
+            if not available:
+                print(f"[QUEUE:{dispatcher_id}] ⚠️  No robots available for {issue_key}. Needed {robot_count}, found 0. Will retry later.")
+                return
+
+            # Assign to at most robot_count robots
+            assign_count = min(len(available), robot_count)
+            print(f"[QUEUE:{dispatcher_id}] Will assign {assign_count} robot(s) to {issue_key}")
+            
+            success_all = True
+            assigned_robots = []
+            
+            # Assign robots and immediately track them to prevent race conditions
+            for idx in range(assign_count):
+                robot_id, robot_ip = available[idx]
+                print(f"[QUEUE:{dispatcher_id}] → Sending command to robot {idx+1}/{assign_count}: {robot_id}")
+                success, message_id = send_movement_command(robot_id, robot_ip, coords, issue_type)
+                
+                if not success:
+                    success_all = False
+                    print(f"[QUEUE:{dispatcher_id}] ✗ Failed to send task to {robot_id}")
+                    break
+                else:
+                    assigned_robots.append(robot_id)
+                    # Immediately track this assignment
+                    with assignments_lock:
+                        if issue_key not in issue_assignments:
+                            issue_assignments[issue_key] = []
+                        issue_assignments[issue_key].append(robot_id)
+                    print(f"[QUEUE:{dispatcher_id}] ✓ Task sent to {robot_id} (msg_id={message_id})")
+            
+            print(f"[QUEUE:{dispatcher_id}] Assignment batch complete: {len(assigned_robots)} robot(s) assigned")
+            
+            # Now check if issue is fully assigned and dequeue
+            if success_all and assigned_robots:
+                with assignments_lock:
+                    total_assigned = len(issue_assignments.get(issue_key, []))
+                original_robot_count = ISSUE_LOCATIONS.get(issue_type, {}).get("robot_count", 1)
+                
+                print(f"[QUEUE:{dispatcher_id}] Issue {issue_key}: {total_assigned}/{original_robot_count} robots assigned")
+                
+                if total_assigned >= original_robot_count:
+                    # Issue is now fully assigned, dequeue it
+                    with pending_lock:
+                        if pending_issues and pending_issues[0].get("issue_key") == issue_key:
+                            pending_issues.popleft()
+                            print(f"[QUEUE:{dispatcher_id}] ✓ Issue {issue_key} fully assigned, dequeued. Queue size: {len(pending_issues)}")
+                    # Continue to next issue in queue
+                else:
+                    # Issue still needs more robots, keep it in queue and continue
+                    print(f"[QUEUE:{dispatcher_id}] Issue {issue_key} still needs {original_robot_count - total_assigned} more robot(s)")
+            else:
+                # Send failed, don't dequeue, retry later
+                print(f"[QUEUE:{dispatcher_id}] Send failed or no robots assigned, retrying later")
+                return
+    finally:
+        dispatch_lock.release()
 
 
 def handle_issue_detection(issue_type: str, coordinates: dict, api_data: dict = None):
@@ -856,6 +842,18 @@ def handle_issue_detection(issue_type: str, coordinates: dict, api_data: dict = 
     robot_count = issue_info["robot_count"]
     issue_key = f"{issue_type}_{coordinates.get('x', 0)}_{coordinates.get('y', 0)}_{coordinates.get('z', 0)}"
         # Use coordinates from drone (not from ISSUE_LOCATIONS)
+
+    # If this issue is already active/queued/assigned, skip re-enqueueing
+    with assignments_lock:
+        already_assigned = issue_key in issue_assignments
+    with pending_lock:
+        already_queued = any(item.get("issue_key") == issue_key for item in pending_issues)
+    with issues_lock:
+        already_detected = issue_key in detected_issues
+
+    if already_assigned or already_queued or already_detected:
+        print(f"[ASSIGNMENT] ⚠️ Issue already active or queued: {issue_key} (assigned={already_assigned}, queued={already_queued}, detected={already_detected})")
+        return False
     
     print(f"\n[ASSIGNMENT] ╔════════════════════════════════════════════════════════════╗")
     print(f"[ASSIGNMENT] ║ ROBOT ASSIGNMENT INITIATED                              ║")
@@ -866,37 +864,10 @@ def handle_issue_detection(issue_type: str, coordinates: dict, api_data: dict = 
         print(f"[ASSIGNMENT] ║ API Data: {str(api_data):<49} ║")
     print(f"[ASSIGNMENT] ╚════════════════════════════════════════════════════════════╝\n")
     
-    # Use Q-learning to select robots
-    print(f"[Q-LEARN] Using Q-learning for robot selection...")
-    selected_robots = smart_select_robot(issue_type, coordinates, robot_count)
-
-    if len(selected_robots) < robot_count:
-        print(f"[ASSIGNMENT] ⚠️  No available robots for {issue_type.upper()} (need {robot_count}, have {len(selected_robots)})")
-        enqueue_issue(issue_key, issue_type, coordinates, api_data or {}, robot_count)
-        return False
-
-    print(f"[ASSIGNMENT] ✓ Found {len(selected_robots)} available robot(s)")
-    
-    # Send movement command to each robot with DRONE-PROVIDED coordinates
-    for idx, (robot_id, robot_ip, state) in enumerate(selected_robots, 1):
-        print(f"[ASSIGNMENT] → Assigning Robot {idx}/{len(selected_robots)}: {robot_id} at {robot_ip}")
-        print(f"[ASSIGNMENT]   Target location: X={coordinates.get('x')}, Y={coordinates.get('y')}, Z={coordinates.get('z')} (from drone)")
-        print(f"[ASSIGNMENT]   State: {state}")
-        success, message_id = send_movement_command(robot_id, robot_ip, coordinates, issue_type)
-        if not success:
-            print(f"[ASSIGNMENT] ✗ Failed to assign robot {robot_id} for {issue_type.upper()} detection")
-        else:
-            print(f"[ASSIGNMENT] ✓ Successfully assigned robot {robot_id} (Message ID: {message_id})")
-            
-            # Track task for Q-learning reward calculation
-            with tasks_lock:
-                active_tasks[message_id] = {
-                    "robot_id": robot_id,
-                    "issue_type": issue_type,
-                    "state": state,
-                    "assigned_at": time.time()
-                }
-    
+    # Always enqueue to preserve strict FIFO across issues, then dispatch
+    enqueue_issue(issue_key, issue_type, coordinates, api_data or {}, robot_count)
+    print(f"[ASSIGNMENT] Calling process_issue_queue to dispatch...")
+    process_issue_queue()
     print(f"[ASSIGNMENT] ═════════════════════════════════════════════════════════════\n")
     return True
 
@@ -944,7 +915,8 @@ def api_overview():
         # Get task information
         task_id = dev.get("task_id")
         current_task = dev.get("current_task", {})
-        task_color = current_task.get("color") if task_id else None
+        # Expose issue_type instead of opaque IDs/colors
+        task_issue_type = current_task.get("issue_type") if task_id else None
         
         entry = {
             "id": norm_id,
@@ -955,8 +927,9 @@ def api_overview():
             "position": dev.get("position"),
             "ip": dev.get("ip"),
             "task_id": task_id,
-            "task_color": task_color,
-            "is_busy": bool(task_id),  # True if robot has a task
+            "task_issue_type": task_issue_type,
+            "is_busy": bool(task_id),  # internal
+            "busy": bool(task_id),     # frontend convenience
         }
         if dtype == "robot":
             robots[norm_id] = entry

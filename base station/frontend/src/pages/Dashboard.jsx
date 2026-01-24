@@ -489,13 +489,13 @@ function Dashboard() {
                     <td>
                       <div
                         style={{
-                          color: robot.task_id ? '#fbbf24' : '#22c55e',
+                          color: robot.task_issue_type ? '#fbbf24' : '#22c55e',
                           fontWeight: '600',
                           minWidth: '150px'
                         }}
-                        title={robot.task_color ? `Color: ${robot.task_color}` : 'No task assigned'}
+                        title={robot.task_issue_type ? `Issue: ${robot.task_issue_type}` : 'No task assigned'}
                       >
-                        {robot.task_id ? `${robot.task_color?.toUpperCase() || 'PROCESSING'}` : 'Ready'}
+                        {robot.task_issue_type ? `${robot.task_issue_type.toUpperCase()}` : 'Ready'}
                       </div>
                     </td>
                     <td>
@@ -579,7 +579,7 @@ function Dashboard() {
         </div>
       <div className="panel tower-panel">
         <h2>Operations Map</h2>
-        <IssueMap2D drones={drones} robots={robots} />
+        <IssueMap2D />
       </div>
     </div>
     </div>

@@ -55,8 +55,8 @@ def init_arduino_connection():
 		return False
 
 
-def send_arduino_signal(signal: str, duration_sec: float = 3.0) -> bool:
-	"""Send a signal character to Arduino for specified duration"""
+def send_arduino_signal(signal: str) -> bool:
+	"""Send a single signal character to Arduino"""
 	global arduino_serial
 	
 	if not arduino_serial:
@@ -64,19 +64,12 @@ def send_arduino_signal(signal: str, duration_sec: float = 3.0) -> bool:
 		return False
 	
 	try:
-		# Format: send signal with newline
 		command = f"{signal}\n"
-		start_time = time.time()
-		
 		with arduino_lock:
-			logging.info(f"[ARDUINO] → Sending signal '{signal}' for {duration_sec}s")
-			while time.time() - start_time < duration_sec:
-				arduino_serial.write(command.encode('utf-8'))
-				time.sleep(0.5)  # Send signal every 0.5 seconds
-			
-			logging.info(f"[ARDUINO] ✓ Signal '{signal}' sent for {duration_sec}s")
-			return True
-		
+			arduino_serial.write(command.encode('utf-8'))
+			logging.info(f"[ARDUINO] → Sent signal '{signal}'")
+		return True
+	
 	except Exception as e:
 		logging.error(f"[ARDUINO] ✗ Error sending signal: {e}")
 		return False
@@ -446,60 +439,28 @@ def handle_movement_command(msg: dict, base_station_ip: str = None):
 			"status": "in_progress"
 		}
 	
-	# Perform the movement and rectification
+	# Perform the task execution
 	if command == "move_to_location":
 		try:
-			# Step 1: Send 'F' signal to Arduino for 3 seconds when task received
-			logging.info(f"[MOVEMENT] → Sending 'F' signal to Arduino for task activation")
-			send_arduino_signal('F', duration_sec=3.0)
+			# Step 1: Send 'f' signal
+			logging.info(f"[MOVEMENT] → Sending 'f' signal to Arduino for task activation")
+			send_arduino_signal('f')
 			
-			# Step 2: Send coordinates to Arduino
-			logging.info(f"[MOVEMENT] → Sending coordinates to Arduino: {coordinates}")
-			arduino_success = send_coordinates_to_arduino(coordinates)
+			# Step 2: Wait 4 seconds
+			logging.info(f"[MOVEMENT] ⏱ Executing task for 4 seconds...")
+			time.sleep(4)
 			
-			if not arduino_success:
-				logging.warning("[MOVEMENT] ⚠️  Arduino communication failed, but continuing with simulation")
-			else:
-				logging.info("[MOVEMENT] ✓ Arduino acknowledged coordinates")
+			# Step 3: Send 's' signal to stop
+			logging.info(f"[MOVEMENT] → Sending 's' signal to stop")
+			send_arduino_signal('s')
 			
-			# Step 3: Move to location with real-time position updates
-			global robot_position
-			logging.info(f"[MOVEMENT] → Moving to coordinates: {coordinates}")
-			logging.info(f"[MOVEMENT] → Motor control: Activating movement...")
-			
-			# Calculate initial distance
-			initial_distance = calculate_distance(robot_position, coordinates)
-			logging.info(f"[MOVEMENT] Distance to target: {initial_distance:.2f} units")
-			
-			# Move towards target with position updates (visible in 2D map)
-			while True:
-				distance = calculate_distance(robot_position, coordinates)
-				if distance < 0.5:  # Close enough to target
-					robot_position = {"x": coordinates['x'], "y": coordinates['y'], "z": coordinates['z']}
-					break
-				
-				# Update position towards target
-				robot_position = move_towards_target(robot_position, coordinates, MOVEMENT_SPEED, MOVEMENT_UPDATE_INTERVAL)
-				logging.info(f"[MOVEMENT] Current position: ({robot_position['x']:.1f}, {robot_position['y']:.1f}) - Distance remaining: {distance:.1f}")
-				time.sleep(MOVEMENT_UPDATE_INTERVAL)
-			
-			logging.info(f"[MOVEMENT] ✓ Arrived at location ({robot_position['x']}, {robot_position['y']})")
-			
-			# Step 4: Rectify the issue
-			logging.info(f"[MOVEMENT] → Starting issue rectification for {issue_type.upper()}")
-			logging.info(f"[MOVEMENT] → Activating remediation mechanism...")
-			# TODO: Replace with actual rectification mechanism
-			# e.g., remediation_system.fix_issue(issue_type)
-			time.sleep(2)  # Simulate remediation time
-			logging.info(f"[MOVEMENT] ✓ Issue {issue_type.upper()} rectified successfully")
-			
-			# Step 5: Update task status
+			# Step 4: Update task status
 			with task_lock:
 				if current_task:
 					current_task["status"] = "completed"
 					current_task["completed_at"] = time.time()
 			
-			# Step 6: Report completion back to base station
+			# Step 5: Report completion back to base station
 			if base_station_ip:
 				completion_report = {
 					"task_id": message_id,

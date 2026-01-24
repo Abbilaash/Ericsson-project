@@ -20,12 +20,6 @@ POSITION_UPDATE_INTERVAL_SEC = 1  # Update position every 1 second
 # Drone position (simulated - in real scenario would come from GPS/sensors)
 drone_position = {"x": 10.0, "y": 20.0, "z": 15.0}
 
-# Inspection waypoints and patrol state
-inspection_waypoints = []
-current_waypoint_index = 0
-patrol_active = False
-tower_location = None  # {x, y, radius}
-
 # QR Code to Issue Type Mapping
 QR_CODE_TO_ISSUE = {
 	"RUST_QR": "rust",
@@ -193,69 +187,6 @@ def send_heartbeat(base_station_ip: str, stop_event: threading.Event | None = No
 			except OSError as e:
 				logging.error("Failed to send HEARTBEAT: %s", e)
 			time.sleep(HEARTBEAT_INTERVAL_SEC)
-
-def generate_inspection_waypoints(tower_x: float, tower_y: float, radius: float, num_points: int = 20) -> list:
-	"""Generate circular inspection pattern around tower location"""
-	waypoints = []
-	z_altitude = 15.0  # Fixed altitude for inspection
-	
-	# Generate points in a circle around the tower
-	# Waypoints should be 5 meters beyond the tower radius
-	for i in range(num_points):
-		angle = (2 * math.pi * i) / num_points
-		waypoint_radius = radius + 5.0
-		x = tower_x + waypoint_radius * math.cos(angle)
-		y = tower_y + waypoint_radius * math.sin(angle)
-		waypoints.append({"x": round(x, 2), "y": round(y, 2), "z": z_altitude})
-
-	logging.info(f"[PATROL] Generated {num_points} inspection waypoints around tower ({tower_x}, {tower_y}) with radius {radius}+5m offset")
-	return waypoints
-
-def update_drone_patrol_position() -> None:
-	"""Move drone to next waypoint in inspection pattern"""
-	global drone_position, current_waypoint_index, patrol_active, inspection_waypoints
-	
-	if not patrol_active or not inspection_waypoints:
-		return
-	
-	# Get current target waypoint
-	target = inspection_waypoints[current_waypoint_index]
-	
-	# Move exactly to waypoint coordinates (no interpolation)
-	drone_position["x"] = target["x"]
-	drone_position["y"] = target["y"]
-	drone_position["z"] = target["z"]
-	
-	# Move to next waypoint
-	current_waypoint_index = (current_waypoint_index + 1) % len(inspection_waypoints)
-	logging.info(f"[PATROL] Moved to waypoint {current_waypoint_index}/{len(inspection_waypoints)}: ({drone_position['x']}, {drone_position['y']}, {drone_position['z']})")
-
-def send_position_update(base_station_ip: str, stop_event: threading.Event) -> None:
-	"""Send position updates to base station every 1 second"""
-	with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-		while True:
-			if stop_event and stop_event.is_set():
-				logging.info("[POSITION] Position updates stopped")
-				return
-			
-			try:
-				# Update patrol position if active
-				update_drone_patrol_position()
-				
-				payload = {
-					"message_type": "POSITION_UPDATE",
-					"device_id": device_id,
-					"device_type": "drone",
-					"sender_ip": sender_ip,
-					"position": drone_position
-				}
-				data = json.dumps(payload).encode("utf-8")
-				sock.sendto(data, (base_station_ip, UDP_SERVER_PORT))
-				logging.debug(f"[POSITION] Sent position update: ({drone_position['x']}, {drone_position['y']}, {drone_position['z']})")
-			except OSError as e:
-				logging.error(f"[POSITION] Failed to send position update: {e}")
-			
-			time.sleep(POSITION_UPDATE_INTERVAL_SEC)
 
 def send_message_to_base_station(base_station_ip: str, message_type: str, content: dict):
 	"""
@@ -584,21 +515,11 @@ def main():
 		return
 	logging.info("Stored base station IP: %s", base_ip)
 	
-	# Generate inspection pattern around default tower location (125, 100) with radius 30
-	tower_location = {"x": 125, "y": 100, "radius": 60}
-	inspection_waypoints = generate_inspection_waypoints(tower_location["x"], tower_location["y"], tower_location["radius"], 20)
-	patrol_active = True
-	logging.info(f"[PATROL] Starting patrol around tower at ({tower_location['x']}, {tower_location['y']})")
-	
 	stop_event = threading.Event()
 	
 	# Start heartbeat thread
 	hb_thread = threading.Thread(target=send_heartbeat, args=(base_ip, stop_event), daemon=True)
 	hb_thread.start()
-
-	# Start position update thread
-	pos_thread = threading.Thread(target=send_position_update, args=(base_ip, stop_event), daemon=True)
-	pos_thread.start()
 
 	# Start video detection thread with base_ip for message sending
 	video_thread = threading.Thread(target=start_video_detection, args=(stop_event, base_ip), daemon=True)
@@ -616,7 +537,6 @@ def main():
 		stop_event.set()
 		cleanup_connections()
 		hb_thread.join(timeout=5)
-		pos_thread.join(timeout=5)
 		video_thread.join(timeout=5)
 		msg_thread.join(timeout=5)
 

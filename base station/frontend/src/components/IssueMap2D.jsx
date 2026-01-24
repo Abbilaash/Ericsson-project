@@ -3,7 +3,7 @@ import './IssueMap2D.css';
 
 const API_BASE = 'http://localhost:5000';
 
-function IssueMap2D({ drones, robots, issues, tower, towerCenter }) {
+function IssueMap2D({ issues, tower, towerCenter }) {
   const canvasRef = useRef(null);
   const [hoveredEntity, setHoveredEntity] = useState(null);
   const [tooltip, setTooltip] = useState(null);
@@ -205,120 +205,6 @@ function IssueMap2D({ drones, robots, issues, tower, towerCenter }) {
     });
     console.log(`[Canvas] ========== FINISHED DRAWING ISSUES ==========`);
 
-    // Draw drones (blue triangles) - from real device positions
-    const drones = Object.entries(devicesPositions).filter(([, dev]) => dev.device_type === 'drone');
-    console.log(`[Canvas] Drawing ${drones.length} drones`);
-    drones.forEach(([dev_id, dev]) => {
-      
-      const position = dev.position;
-      let x, y;
-
-      if (typeof position === 'string') {
-        const match = position.match(/\(([^,]+),\s*([^,]+),\s*([^)]+)\)/);
-        if (match) {
-          x = parseFloat(match[1]);
-          y = parseFloat(match[2]);
-        } else {
-          return;
-        }
-      } else if (position && typeof position === 'object') {
-        x = position.x;
-        y = position.y;
-      } else {
-        return;
-      }
-
-      console.log(`[Canvas] Drone ${dev_id}: position (${x}, ${y})`);
-      const cx = toCanvasX(x);
-      const cy = toCanvasY(y);
-      const size = 10;
-
-      // Draw triangle
-      ctx.fillStyle = '#3b82f6';
-      ctx.beginPath();
-      ctx.moveTo(cx, cy - size);
-      ctx.lineTo(cx - size, cy + size);
-      ctx.lineTo(cx + size, cy + size);
-      ctx.closePath();
-      ctx.fill();
-
-      // Border
-      ctx.strokeStyle = '#93c5fd';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-
-      entitiesRef.current.push({
-        type: 'drone',
-        droneId: dev_id,
-        x: cx,
-        y: cy,
-        radius: size + 5,
-        data: {
-          type: 'Drone',
-          id: dev_id || 'Unknown',
-          status: dev.status || 'Unknown',
-          position: `(${x}, ${y})`,
-          'updated at': new Date(dev.updated_at * 1000).toLocaleTimeString()
-        }
-      });
-    });
-
-    // Draw robots (green circles) - from real device positions
-    const robots = Object.entries(devicesPositions).filter(([, dev]) => dev.device_type === 'robot');
-    console.log(`[Canvas] Drawing ${robots.length} robots`);
-    robots.forEach(([dev_id, dev]) => {
-      
-      const position = dev.position;
-      let x, y;
-
-      if (typeof position === 'string') {
-        const match = position.match(/\(([^,]+),\s*([^,]+),\s*([^)]+)\)/);
-        if (match) {
-          x = parseFloat(match[1]);
-          y = parseFloat(match[2]);
-        } else {
-          return;
-        }
-      } else if (position && typeof position === 'object') {
-        x = position.x;
-        y = position.y;
-      } else {
-        return;
-      }
-
-      console.log(`[Canvas] Robot ${dev_id}: position (${x}, ${y})`);
-      const cx = toCanvasX(x);
-      const cy = toCanvasY(y);
-      const radius = 8;
-
-      // Draw circle
-      ctx.fillStyle = '#22c55e';
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, 0, 2 * Math.PI);
-      ctx.fill();
-
-      // Border
-      ctx.strokeStyle = '#86efac';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-
-      entitiesRef.current.push({
-        type: 'robot',
-        robotId: dev_id,
-        x: cx,
-        y: cy,
-        radius: radius + 5,
-        data: {
-          type: 'Robot',
-          id: dev_id || 'Unknown',
-          status: dev.status || 'Idle',
-          position: `(${x}, ${y})`,
-          'busy': dev.task_id ? 'Yes' : 'No',
-          'updated at': new Date(dev.updated_at * 1000).toLocaleTimeString()
-        }
-      });
-    });
-
     // Handle mouse move for hover
     const handleMouseMove = (e) => {
       const rect = canvas.getBoundingClientRect();
@@ -385,14 +271,6 @@ function IssueMap2D({ drones, robots, issues, tower, towerCenter }) {
         <div className="legend-item">
           <div className="legend-symbol issue-symbol"></div>
           <span>Issue (Red Square)</span>
-        </div>
-        <div className="legend-item">
-          <div className="legend-symbol drone-symbol"></div>
-          <span>Drone (Blue Triangle)</span>
-        </div>
-        <div className="legend-item">
-          <div className="legend-symbol robot-symbol"></div>
-          <span>Robot (Green Circle)</span>
         </div>
         <div className="legend-item">
           <div className="legend-symbol waypoint-symbol"></div>

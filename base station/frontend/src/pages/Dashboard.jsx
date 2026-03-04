@@ -1,5 +1,4 @@
 import { useState, useEffect } from 'react';
-import IssueMap2D from '../components/IssueMap2D';
 import './Dashboard.css';
 
 const API_BASE = 'http://localhost:5000';
@@ -8,13 +7,9 @@ const DEVICES_API = 'http://localhost:5001';
 function Dashboard() {
   const [drones, setDrones] = useState([]);
   const [robots, setRobots] = useState([]);
-  const [tasks, setTasks] = useState([]);
   const [networkSummary, setNetworkSummary] = useState({
     dronesOnline: 0,
-    robotsOnline: 0,
-    activeTasks: 0,
-    completedTasks: 0,
-    failedTasks: 0
+    robotsOnline: 0
   });
 
   useEffect(() => {
@@ -49,21 +44,13 @@ function Dashboard() {
         id,
         ...robot
       }));
-      const tasksArray = Object.entries(data.tasks || {}).map(([id, task]) => ({
-        id,
-        ...task
-      }));
 
       setDrones(dronesArray);
       setRobots(robotsArray);
-      setTasks(tasksArray);
 
       setNetworkSummary({
         dronesOnline: dronesArray.length,
-        robotsOnline: robotsArray.length,
-        activeTasks: tasksArray.filter(t => t.status === 'CLAIMED').length,
-        completedTasks: tasksArray.filter(t => t.status === 'DONE').length,
-        failedTasks: 0
+        robotsOnline: robotsArray.length
       });
 
       // Merge devices from lightweight server (TCP/UDP)
@@ -577,10 +564,6 @@ function Dashboard() {
             </table>
           </div>
         </div>
-      <div className="panel tower-panel">
-        <h2>Operations Map</h2>
-        <IssueMap2D />
-      </div>
     </div>
     </div>
   );

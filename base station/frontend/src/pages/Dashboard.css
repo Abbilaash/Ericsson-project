@@ -174,3 +174,8 @@ tbody tr:hover {
     height: 600px;
   }
 }
+
+tbody td {
+  position: relative;
+  overflow: visible;
+}

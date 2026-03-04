@@ -32,16 +32,19 @@ ISSUE_LOCATIONS = {
     "rust": {
         "coordinates": {"x": 65, "y": 100, "z": 10},
         "robot_count": 1,
+        "required_robot_type": "TYPE1",
         "description": "Rust detected at location"
     },
     "overheated_circuit": {
         "coordinates": {"x": 120, "y": 150, "z": 5},
         "robot_count": 2,
-        "description": "Overheated circuit detected at location"
+        "required_robot_types": ["TYPE1", "TYPE2"],
+        "description": "Circuit overheating at panel",
     },
     "tilted_antenna": {
         "coordinates": {"x": 200, "y": 100, "z": 20},
         "robot_count": 1,
+        "required_robot_type": "TYPE2",
         "description": "Tilted antenna detected at location"
     }
 }
@@ -71,6 +74,8 @@ last_position_log = defaultdict(float)
 # Track detected issues with their locations and status
 detected_issues = {}  # Format: {issue_key: {"issue_type": "...", "coordinates": {...}, "timestamp": ..., "drone_id": "..."}}
 issues_lock = threading.Lock()
+# Track multi-stage progress per issue (e.g., overheated_circuit TYPE1 -> TYPE2)
+issue_progress = {}  # Format: {issue_key: stage_index}
 
 # Queue to hold pending issues when no robots are available
 pending_issues = deque()  # Each item: {issue_key, issue_type, coordinates, api_data, robot_count, enqueued_at}
@@ -79,6 +84,10 @@ pending_lock = threading.Lock()
 # Track which robots have been assigned to which issues (prevent duplicate assignments)
 issue_assignments = {}  # Format: {issue_key: [robot_id1, robot_id2, ...]}
 assignments_lock = threading.Lock()
+
+# Sequential dispatch control - only process one issue at a time globally
+current_active_issue = None  # Stores the issue_key currently being worked on
+active_issue_lock = threading.Lock()
 
 # Command logs for tracking drone/robot control commands
 command_logs = []  # Format: {drone_id, command, base_station_ip, timestamp}
@@ -259,6 +268,7 @@ def handle_tcp_client(client_sock, client_ip):
                             coordinates = content.get('coordinates', {})
                             status = content.get('status')
                             message = content.get('message')
+                            stage = content.get('stage', 0)
 
                             freed = False
                             # Prefer freeing by matching task_id to avoid freeing multiple robots by IP
@@ -290,26 +300,67 @@ def handle_tcp_client(client_sock, client_ip):
                                     dev["status"] = "READY"
                                     dev["updated_at"] = time.time()
                                     freed = True
-                                    print(f"[TASK] ✓ Task completed by {dev_id} (status={status}, task_id={task_id})")
+                                    print(f"[TASK] ✓ Task completed by {dev_id} (status={status}, task_id={task_id}, stage={stage})")
                                     print(f"[TASK] ✓ Robot is now available for new assignments")
                                     
-                                    # Remove the issue from detected_issues
                                     if issue_type and coordinates:
                                         issue_key = f"{issue_type}_{coordinates.get('x', 0)}_{coordinates.get('y', 0)}_{coordinates.get('z', 0)}"
-                                        with issues_lock:
-                                            if issue_key in detected_issues:
-                                                del detected_issues[issue_key]
-                                                print(f"[ISSUE] Removed resolved issue: {issue_type} at {coordinates}")
-                                        # Also clean up assignment tracking for this robot
+
+                                        # Clean up assignment tracking for this robot
                                         with assignments_lock:
                                             if issue_key in issue_assignments:
                                                 if dev_id in issue_assignments[issue_key]:
                                                     issue_assignments[issue_key].remove(dev_id)
                                                     print(f"[TASK] Removed {dev_id} from assignment tracking for {issue_key}")
-                                                # If no more robots assigned to this issue, remove the entry
                                                 if not issue_assignments[issue_key]:
                                                     del issue_assignments[issue_key]
                                                     print(f"[TASK] Cleaned up assignment tracking for completed issue {issue_key}")
+
+                                        # Determine if multi-stage and enqueue next stage if needed
+                                        with issues_lock:
+                                            progress = issue_progress.get(issue_key)
+                                            required_robot_types = []
+                                            if progress:
+                                                required_robot_types = progress.get("required_robot_types") or []
+                                            elif issue_type in ISSUE_LOCATIONS:
+                                                info = ISSUE_LOCATIONS[issue_type]
+                                                rrt = info.get("required_robot_types") or ([] if not info.get("required_robot_type") else [info.get("required_robot_type")])
+                                                required_robot_types = rrt
+                                            staged = bool(required_robot_types)
+                                            if staged:
+                                                issue_progress[issue_key] = {
+                                                    "required_robot_types": required_robot_types,
+                                                    "current_stage": stage
+                                                }
+                                        next_stage = stage + 1
+                                        final_stage = not bool(required_robot_types) or next_stage >= len(required_robot_types)
+
+                                        if final_stage:
+                                            with issues_lock:
+                                                if issue_key in detected_issues:
+                                                    del detected_issues[issue_key]
+                                                    print(f"[ISSUE] Removed resolved issue: {issue_type} at {coordinates}")
+                                                if issue_key in issue_progress:
+                                                    del issue_progress[issue_key]
+                                                    print(f"[ISSUE] Cleared progress tracking for {issue_key}")
+                                            # Clear active issue when completely finished
+                                            with active_issue_lock:
+                                                if globals().get('current_active_issue') == issue_key:
+                                                    globals()['current_active_issue'] = None
+                                                    print(f"[TASK] ✓ Issue {issue_key} fully completed. Cleared active issue. Ready for next issue.")
+                                        else:
+                                            print(f"[TASK] Staged issue: enqueuing next stage {next_stage} for {issue_key}")
+                                            enqueue_issue(
+                                                issue_key,
+                                                issue_type,
+                                                coordinates,
+                                                api_data={},
+                                                robot_count=1,
+                                                required_robot_type=required_robot_types[next_stage],
+                                                required_robot_types=required_robot_types,
+                                                stage=next_stage,
+                                            )
+                                            process_issue_queue()
                             # Attempt to dispatch any queued issues now that a robot freed up
                             if freed:
                                 process_issue_queue()
@@ -457,14 +508,21 @@ def udp_listener():
                     except Exception as e:
                         status = f"ACK_FAIL: {e}"
 
+                    # Extract robot_type if provided
+                    robot_type = msg.get('robot_type') if device_type.lower() == "robot" else None
+                    
                     devices[device_id] = {
                         "device_id": device_id,
                         "ip": device_ip,
                         "status": status,
                         "position": position,
                         "device_type": device_type,
+                        "robot_type": robot_type,
                         "updated_at": time.time()
                     }
+                    
+                    if robot_type:
+                        print(f"[UDP] Robot {device_id} registered as {robot_type}")
 
                     # If a robot just joined, try to dispatch queued issues immediately
                     if device_type.lower() == "robot":
@@ -601,9 +659,10 @@ def find_available_robot():
     return None, None
 
 
-def find_available_robots(count: int):
+def find_available_robots(count: int, required_type: str = None):
     """
-    Find N available robots that are not assigned to any task
+    Find N available robots that are not assigned to any task.
+    Optionally filter by robot type (e.g., TYPE1, TYPE2)
     Returns: list of (robot_id, robot_ip) tuples, may be less than count if not enough robots
     """
     available = []
@@ -612,6 +671,11 @@ def find_available_robots(count: int):
         for dev_id, dev in devices.items():
             if dev.get("device_type", "").lower() == "robot":
                 total_robots += 1
+                # Filter by robot type if specified
+                if required_type and dev.get("robot_type") != required_type:
+                    print(f"[FIND] Skipping {dev_id}: type {dev.get('robot_type')} != {required_type}")
+                    continue
+                
                 task_id = dev.get("task_id")
                 status = dev.get("status", "UNKNOWN")
                 if not task_id:
@@ -620,11 +684,11 @@ def find_available_robots(count: int):
                         break
                 else:
                     print(f"[FIND] Robot {dev_id} busy: task_id={task_id}, status={status}")
-    print(f"[FIND] Total robots: {total_robots}, Available: {len(available)}, Requested: {count}")
+    print(f"[FIND] Total robots: {total_robots}, Available: {len(available)}, Requested: {count}, Type: {required_type}")
     return available
 
 
-def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, issue_type: str):
+def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, issue_type: str, stage: int = 0):
     """
     Send a movement command to a specific robot
     Returns: (success, message_id)
@@ -649,7 +713,8 @@ def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, issue
                 "content": {
                     "issue_type": issue_type,
                     "coordinates": coordinates,
-                    "command": "move_to_location"
+                    "command": "move_to_location",
+                    "stage": stage
                 }
             }
             
@@ -696,8 +761,15 @@ def send_movement_command(robot_id: str, robot_ip: str, coordinates: dict, issue
         return False, None
 
 
-def enqueue_issue(issue_key: str, issue_type: str, coordinates: dict, api_data: dict, robot_count: int):
+def enqueue_issue(issue_key: str, issue_type: str, coordinates: dict, api_data: dict, robot_count: int, required_robot_type: str = None, required_robot_types: list = None, stage: int = 0):
     """Add issue to pending queue if not already queued."""
+    # Track staged issue progress for multi-stage flows
+    if required_robot_types:
+        with issues_lock:
+            issue_progress[issue_key] = {
+                "required_robot_types": required_robot_types,
+                "current_stage": stage
+            }
     with pending_lock:
         for item in pending_issues:
             if item.get("issue_key") == issue_key:
@@ -709,13 +781,17 @@ def enqueue_issue(issue_key: str, issue_type: str, coordinates: dict, api_data: 
             "coordinates": coordinates,
             "api_data": api_data,
             "robot_count": robot_count,
+            "required_robot_type": required_robot_type,
+            "required_robot_types": required_robot_types,
+            "stage": stage,
             "enqueued_at": time.time()
         })
-        print(f"[QUEUE] Enqueued issue {issue_key}. Queue size: {len(pending_issues)}")
+        print(f"[QUEUE] Enqueued issue {issue_key} (stage {stage}, requires {required_robot_type}). Queue size: {len(pending_issues)}")
 
 
 def process_issue_queue():
-    """Try to dispatch queued issues when robots become available (FIFO)."""
+    """Try to dispatch queued issues sequentially when robots become available."""
+    global current_active_issue
     dispatcher_id = f"D{int(time.time() * 1000000) % 10000}"
     # Ensure only one dispatcher runs at a time
     if not dispatch_lock.acquire(blocking=False):
@@ -724,6 +800,12 @@ def process_issue_queue():
     
     print(f"[QUEUE:{dispatcher_id}] 🚀 Starting dispatch process...")
     try:
+        # Check if another issue is already active
+        with active_issue_lock:
+            if current_active_issue is not None:
+                print(f"[QUEUE:{dispatcher_id}] ⚠️  Issue {current_active_issue} is currently active. Waiting for it to complete before processing next issue.")
+                return
+        
         while True:
             # Atomically: get issue and remove any duplicates from queue
             with pending_lock:
@@ -753,13 +835,27 @@ def process_issue_queue():
             coords = issue.get("coordinates", {})
             api_data = issue.get("api_data", {})
             robot_count = issue.get("robot_count", 1)
+            required_robot_type = issue.get("required_robot_type")
+            required_robot_types = issue.get("required_robot_types") or ([required_robot_type] if required_robot_type else [])
+            stage = issue.get("stage", 0)
             issue_key = issue.get("issue_key")
 
-            print(f"[QUEUE:{dispatcher_id}] Processing issue {issue_key}, needs {robot_count} robot(s)")
-            print(f"[QUEUE:{dispatcher_id}] Searching for available robots...")
+            # Determine required type for this stage
+            if required_robot_types:
+                if stage >= len(required_robot_types):
+                    print(f"[QUEUE:{dispatcher_id}] ⚠️ Stage index out of range for {issue_key}. Skipping.")
+                    with pending_lock:
+                        if pending_issues and pending_issues[0].get("issue_key") == issue_key:
+                            pending_issues.popleft()
+                    continue
+                required_robot_type = required_robot_types[stage]
+                robot_count = 1  # one robot per stage
+
+            print(f"[QUEUE:{dispatcher_id}] Processing issue {issue_key} (stage {stage}), needs {robot_count} {required_robot_type} robot(s)")
+            print(f"[QUEUE:{dispatcher_id}] Searching for available {required_robot_type} robots...")
             
-            # Get available robots (not already assigned to this issue)
-            available = find_available_robots(robot_count)
+            # Get available robots of the required type
+            available = find_available_robots(robot_count, required_robot_type)
             print(f"[QUEUE:{dispatcher_id}] Found {len(available)} available robot(s): {[r[0] for r in available]}")
             
             # Filter out robots already assigned to this issue
@@ -771,22 +867,35 @@ def process_issue_queue():
                 print(f"[QUEUE:{dispatcher_id}] ⚠️  No robots available for {issue_key}. Needed {robot_count}, found 0. Will retry later.")
                 return
 
-            # Assign to at most robot_count robots
-            assign_count = min(len(available), robot_count)
+            # Require full team: do not partially assign multi-robot issues
+            if len(available) < robot_count:
+                print(f"[QUEUE:{dispatcher_id}] ⚠️  Not enough robots for {issue_key}. Needed {robot_count}, have {len(available)}. Waiting.")
+                return
+
+            # Assign exactly the required robots
+            assign_count = robot_count
             print(f"[QUEUE:{dispatcher_id}] Will assign {assign_count} robot(s) to {issue_key}")
             
             success_all = True
             assigned_robots = []
             
+            # Set this issue as active BEFORE assigning robots
+            with active_issue_lock:
+                globals()['current_active_issue'] = issue_key
+                print(f"[QUEUE:{dispatcher_id}] ✓ Activated issue: {issue_key}")
+            
             # Assign robots and immediately track them to prevent race conditions
             for idx in range(assign_count):
                 robot_id, robot_ip = available[idx]
                 print(f"[QUEUE:{dispatcher_id}] → Sending command to robot {idx+1}/{assign_count}: {robot_id}")
-                success, message_id = send_movement_command(robot_id, robot_ip, coords, issue_type)
+                success, message_id = send_movement_command(robot_id, robot_ip, coords, issue_type, stage)
                 
                 if not success:
                     success_all = False
                     print(f"[QUEUE:{dispatcher_id}] ✗ Failed to send task to {robot_id}")
+                    # Clear active issue if assignment fails
+                    with active_issue_lock:
+                        globals()['current_active_issue'] = None
                     break
                 else:
                     assigned_robots.append(robot_id)
@@ -799,24 +908,12 @@ def process_issue_queue():
             
             print(f"[QUEUE:{dispatcher_id}] Assignment batch complete: {len(assigned_robots)} robot(s) assigned")
             
-            # Now check if issue is fully assigned and dequeue
+            # For staged issues (e.g., overheated_circuit), dequeue after stage assignment
             if success_all and assigned_robots:
-                with assignments_lock:
-                    total_assigned = len(issue_assignments.get(issue_key, []))
-                original_robot_count = ISSUE_LOCATIONS.get(issue_type, {}).get("robot_count", 1)
-                
-                print(f"[QUEUE:{dispatcher_id}] Issue {issue_key}: {total_assigned}/{original_robot_count} robots assigned")
-                
-                if total_assigned >= original_robot_count:
-                    # Issue is now fully assigned, dequeue it
-                    with pending_lock:
-                        if pending_issues and pending_issues[0].get("issue_key") == issue_key:
-                            pending_issues.popleft()
-                            print(f"[QUEUE:{dispatcher_id}] ✓ Issue {issue_key} fully assigned, dequeued. Queue size: {len(pending_issues)}")
-                    # Continue to next issue in queue
-                else:
-                    # Issue still needs more robots, keep it in queue and continue
-                    print(f"[QUEUE:{dispatcher_id}] Issue {issue_key} still needs {original_robot_count - total_assigned} more robot(s)")
+                with pending_lock:
+                    if pending_issues and pending_issues[0].get("issue_key") == issue_key:
+                        pending_issues.popleft()
+                        print(f"[QUEUE:{dispatcher_id}] ✓ Stage {stage} assigned for {issue_key}, dequeued. Queue size: {len(pending_issues)}")
             else:
                 # Send failed, don't dequeue, retry later
                 print(f"[QUEUE:{dispatcher_id}] Send failed or no robots assigned, retrying later")
@@ -837,9 +934,11 @@ def handle_issue_detection(issue_type: str, coordinates: dict, api_data: dict = 
         print(f"[ASSIGNMENT] ✗ Unknown issue type: {issue_type}")
         return False
     
-    # Get robot count from ISSUE_LOCATIONS, but use drone-provided coordinates
+    # Get robot count and type from ISSUE_LOCATIONS, but use drone-provided coordinates
     issue_info = ISSUE_LOCATIONS[issue_type]
     robot_count = issue_info["robot_count"]
+    required_robot_type = issue_info.get("required_robot_type")
+    required_robot_types = issue_info.get("required_robot_types") or ([] if not required_robot_type else [required_robot_type])
     issue_key = f"{issue_type}_{coordinates.get('x', 0)}_{coordinates.get('y', 0)}_{coordinates.get('z', 0)}"
         # Use coordinates from drone (not from ISSUE_LOCATIONS)
 
@@ -858,14 +957,17 @@ def handle_issue_detection(issue_type: str, coordinates: dict, api_data: dict = 
     print(f"\n[ASSIGNMENT] ╔════════════════════════════════════════════════════════════╗")
     print(f"[ASSIGNMENT] ║ ROBOT ASSIGNMENT INITIATED                              ║")
     print(f"[ASSIGNMENT] ║ Issue Type: {issue_type.upper():<43} ║")
-    print(f"[ASSIGNMENT] ║ Required Robots: {robot_count:<45} ║")
+    if required_robot_types:
+        print(f"[ASSIGNMENT] ║ Stages: {required_robot_types}                                       ║")
+    else:
+        print(f"[ASSIGNMENT] ║ Required Robots: {robot_count} x {required_robot_type:<37} ║")
     print(f"[ASSIGNMENT] ║ Drone-Detected Location: X={coordinates.get('x', 0)}, Y={coordinates.get('y', 0)}, Z={coordinates.get('z', 0):<15} ║")
     if api_data:
         print(f"[ASSIGNMENT] ║ API Data: {str(api_data):<49} ║")
     print(f"[ASSIGNMENT] ╚════════════════════════════════════════════════════════════╝\n")
     
     # Always enqueue to preserve strict FIFO across issues, then dispatch
-    enqueue_issue(issue_key, issue_type, coordinates, api_data or {}, robot_count)
+    enqueue_issue(issue_key, issue_type, coordinates, api_data or {}, robot_count, required_robot_type, required_robot_types, stage=0)
     print(f"[ASSIGNMENT] Calling process_issue_queue to dispatch...")
     process_issue_queue()
     print(f"[ASSIGNMENT] ═════════════════════════════════════════════════════════════\n")

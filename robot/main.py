@@ -223,7 +223,6 @@ def type1_overheated_circuit_detected_movement():
                 return False
 
 def type2_overheated_circuit_detected_movement():
-        """TYPE2 movement sequence for tilted_antenna detection"""
         global arduino_serial
 
         if not arduino_serial:
@@ -440,69 +439,22 @@ def type2_detected_movement():
                 print("Sending 'f' signal...")
                 arduino_serial.write(b'f\n')
                 print("'f' signal sent!")
-                time.sleep(1.4)
+                time.sleep(2)
 
                 print("Sending 's' signal...")
                 arduino_serial.write(b's\n')
                 print("'s' signal sent!")
-
-                print("Sending 'r' signal...")
-                arduino_serial.write(b'r\n')
-                print("'r' signal sent!")
-                time.sleep(0.8)
-
-                print("Sending 's' signal...")
-                arduino_serial.write(b's\n')
-                print("'s' signal sent!")
-
-                print("Sending 'f' signal...")
-                arduino_serial.write(b'f\n')
-                print("'f' signal sent!")
-                time.sleep(2.3)
-
-                print("Sending 's' signal...")
-                arduino_serial.write(b's\n')
-                print("'s' signal sent!")
-
-                # === ARM TASK - Tilting Operation ===
-                import tilting
-                time.sleep(1)
+                time.sleep(2)
 
                 print("Sending 'b' signal...")
                 arduino_serial.write(b'b\n')
                 print("'b' signal sent!")
-                time.sleep(2.4)
+                time.sleep(2)
 
                 print("Sending 's' signal...")
                 arduino_serial.write(b's\n')
                 print("'s' signal sent!")
 
-                print("Sending 'r' signal...")
-                arduino_serial.write(b'r\n')
-                print("'r' signal sent!")
-                time.sleep(0.8)
-
-                print("Sending 's' signal...")
-                arduino_serial.write(b's\n')
-                print("'s' signal sent!")
-
-                print("Sending 'f' signal...")
-                arduino_serial.write(b'f\n')
-                print("'f' signal sent!")
-                time.sleep(1.4)
-
-                print("Sending 's' signal...")
-                arduino_serial.write(b's\n')
-                print("'s' signal sent!")
-
-                print("Sending 'l' signal...")
-                arduino_serial.write(b'l\n')
-                print("'l' signal sent!")
-                time.sleep(1.5)
-
-                print("Sending 's' signal...")
-                arduino_serial.write(b's\n')
-                print("'s' signal sent!")
 
                 logging.info("[TYPE2] ✓ TYPE2 tilted_antenna movement sequence complete!")
                 return True

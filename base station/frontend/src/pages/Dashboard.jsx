@@ -40,10 +40,11 @@ function Dashboard() {
           id,
           ...drone
         }));
-      const robotsArray = Object.entries(data.robots || {}).map(([id, robot]) => ({
-        id,
-        ...robot
-      }));
+      const robotsArray = Object.entries(data.robots || {})
+        .map(([id, robot]) => ({
+          id,
+          ...robot
+        }));
 
       setDrones(dronesArray);
       setRobots(robotsArray);
@@ -132,7 +133,7 @@ function Dashboard() {
           device_type: deviceType
         })
       });
-      
+
       const data = await response.json();
       if (data.success) {
         alert(`Battery low simulation sent to ${deviceId}`);
@@ -158,7 +159,7 @@ function Dashboard() {
           device_type: deviceType
         })
       });
-      
+
       const data = await response.json();
       if (data.success) {
         alert(`Overheated circuit simulation sent to ${deviceId}`);
@@ -184,7 +185,7 @@ function Dashboard() {
           device_type: deviceType
         })
       });
-      
+
       const data = await response.json();
       if (data.success) {
         alert(`Issue A simulation sent to ${deviceId}`);
@@ -210,7 +211,7 @@ function Dashboard() {
           device_type: deviceType
         })
       });
-      
+
       const data = await response.json();
       if (data.success) {
         alert(`Issue B simulation sent to ${deviceId}`);
@@ -237,7 +238,7 @@ function Dashboard() {
           command: 'ENGAGE'
         })
       });
-      
+
       const data = await response.json();
       if (data.success) {
         // Log the command to backend
@@ -250,7 +251,7 @@ function Dashboard() {
             command: 'ENGAGE'
           })
         }).catch(err => console.error('Failed to log command:', err));
-        
+
         alert(`Engage command sent to ${deviceId}`);
       } else {
         alert(`Error: ${data.error}`);
@@ -275,7 +276,7 @@ function Dashboard() {
           command: 'GROUND'
         })
       });
-      
+
       const data = await response.json();
       if (data.success) {
         // Log the command to backend
@@ -288,7 +289,7 @@ function Dashboard() {
             command: 'GROUND'
           })
         }).catch(err => console.error('Failed to log command:', err));
-        
+
         alert(`Ground command sent to ${deviceId}`);
       } else {
         alert(`Error: ${data.error}`);
@@ -313,7 +314,7 @@ function Dashboard() {
           command: 'RETURN_HOME'
         })
       });
-      
+
       const data = await response.json();
       if (data.success) {
         alert(`Return home command sent to ${deviceId}`);
@@ -353,106 +354,155 @@ function Dashboard() {
     }
   };
 
+  const handleForgetDevice = async (deviceId) => {
+    const confirmed = window.confirm(`Forget device ${deviceId}?`);
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE}/api/forget-device`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ device_id: deviceId }),
+      });
+
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        alert(`Error: ${data.error || 'Failed to forget device'}`);
+        return;
+      }
+
+      setDrones(prev => prev.filter(d => d.id !== deviceId));
+      setRobots(prev => prev.filter(r => r.id !== deviceId));
+      setOpenMenus({});
+      fetchData();
+    } catch (error) {
+      console.error('Error forgetting device:', error);
+      alert('Failed to forget device');
+    }
+  };
+
   return (
     <div className="dashboard">
       <div className="top-section">
         <div className="panel drone-panel">
-            <h2>Drone Status</h2>
-            <div className="table-container">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Drone ID</th>
-                    <th>Status</th>
-                    <th>Battery %</th>
-                    <th>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {drones.map(drone => (
-                    <tr key={drone.id} style={{ color: getStatusColor(drone) }}>
-                      <td>{drone.id}</td>
-                      <td>{drone.status || 'ACTIVE'}</td>
-                      <td>{drone.battery ? drone.battery.toFixed(1) : 'N/A'}%</td>
-                      <td>
-                        <div className="menu-container" style={{ position: 'relative' }}>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              toggleMenu(drone.id);
-                            }}
+          <h2>Drone Status</h2>
+          <div className="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>Drone ID</th>
+                  <th>Status</th>
+                  <th>Battery %</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {drones.map(drone => (
+                  <tr key={drone.id} style={{ color: getStatusColor(drone) }}>
+                    <td>{drone.id}</td>
+                    <td>{drone.status || 'ACTIVE'}</td>
+                    <td>{drone.battery ? drone.battery.toFixed(1) : 'N/A'}%</td>
+                    <td>
+                      <div className="menu-container" style={{ position: 'relative' }}>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleMenu(drone.id);
+                          }}
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            color: '#f1f5f9',
+                            cursor: 'pointer',
+                            fontSize: '1.2rem',
+                            padding: '0.25rem 0.5rem'
+                          }}
+                        >
+                          ⋮
+                        </button>
+                        {openMenus[drone.id] && (
+                          <div
                             style={{
-                              background: 'none',
-                              border: 'none',
-                              color: '#f1f5f9',
-                              cursor: 'pointer',
-                              fontSize: '1.2rem',
-                              padding: '0.25rem 0.5rem'
+                              position: 'absolute',
+                              right: 0,
+                              top: '100%',
+                              background: '#1e293b',
+                              border: '1px solid rgba(148, 163, 184, 0.2)',
+                              borderRadius: '4px',
+                              padding: '0.5rem',
+                              zIndex: 1000,
+                              minWidth: '180px',
+                              boxShadow: '0 4px 6px rgba(0, 0, 0, 0.3)'
                             }}
                           >
-                            ⋮
-                          </button>
-                          {openMenus[drone.id] && (
-                            <div
+                            <button
+                              onClick={() => handleEngageDrone(drone.id, 'drone')}
                               style={{
-                                position: 'absolute',
-                                right: 0,
-                                top: '100%',
-                                background: '#1e293b',
-                                border: '1px solid rgba(148, 163, 184, 0.2)',
-                                borderRadius: '4px',
+                                width: '100%',
+                                textAlign: 'left',
+                                background: 'none',
+                                border: 'none',
+                                color: '#22c55e',
+                                cursor: 'pointer',
                                 padding: '0.5rem',
-                                zIndex: 1000,
-                                minWidth: '180px',
-                                boxShadow: '0 4px 6px rgba(0, 0, 0, 0.3)'
+                                fontSize: '0.875rem',
+                                fontWeight: '600'
                               }}
+                              onMouseEnter={(e) => e.target.style.background = 'rgba(34, 197, 94, 0.1)'}
+                              onMouseLeave={(e) => e.target.style.background = 'none'}
                             >
-                              <button
-                                onClick={() => handleEngageDrone(drone.id, 'drone')}
-                                style={{
-                                  width: '100%',
-                                  textAlign: 'left',
-                                  background: 'none',
-                                  border: 'none',
-                                  color: '#22c55e',
-                                  cursor: 'pointer',
-                                  padding: '0.5rem',
-                                  fontSize: '0.875rem',
-                                  fontWeight: '600'
-                                }}
-                                onMouseEnter={(e) => e.target.style.background = 'rgba(34, 197, 94, 0.1)'}
-                                onMouseLeave={(e) => e.target.style.background = 'none'}
-                              >
-                                ENGAGE
-                              </button>
-                              <button
-                                onClick={() => handleGroundDrone(drone.id, 'drone')}
-                                style={{
-                                  width: '100%',
-                                  textAlign: 'left',
-                                  background: 'none',
-                                  border: 'none',
-                                  color: '#ef4444',
-                                  cursor: 'pointer',
-                                  padding: '0.5rem',
-                                  fontSize: '0.875rem',
-                                  fontWeight: '600'
-                                }}
-                                onMouseEnter={(e) => e.target.style.background = 'rgba(239, 68, 68, 0.1)'}
-                                onMouseLeave={(e) => e.target.style.background = 'none'}
-                              >
-                                Disengage
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                              ENGAGE
+                            </button>
+                            <button
+                              onClick={() => handleGroundDrone(drone.id, 'drone')}
+                              style={{
+                                width: '100%',
+                                textAlign: 'left',
+                                background: 'none',
+                                border: 'none',
+                                color: '#ef4444',
+                                cursor: 'pointer',
+                                padding: '0.5rem',
+                                fontSize: '0.875rem',
+                                fontWeight: '600'
+                              }}
+                              onMouseEnter={(e) => e.target.style.background = 'rgba(239, 68, 68, 0.1)'}
+                              onMouseLeave={(e) => e.target.style.background = 'none'}
+                            >
+                              Disengage
+                            </button>
+                            <button
+                              onClick={() => handleForgetDevice(drone.id)}
+                              style={{
+                                width: '100%',
+                                textAlign: 'left',
+                                background: 'none',
+                                border: 'none',
+                                color: '#f59e0b',
+                                cursor: 'pointer',
+                                padding: '0.5rem',
+                                fontSize: '0.875rem',
+                                fontWeight: '600'
+                              }}
+                              onMouseEnter={(e) => e.target.style.background = 'rgba(245, 158, 11, 0.1)'}
+                              onMouseLeave={(e) => e.target.style.background = 'none'}
+                            >
+                              Forget
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
+        </div>
 
         <div className="panel robot-panel">
           <h2>Robot Status</h2>
@@ -554,6 +604,24 @@ function Dashboard() {
                             >
                               Disengage
                             </button>
+                            <button
+                              onClick={() => handleForgetDevice(robot.id)}
+                              style={{
+                                width: '100%',
+                                textAlign: 'left',
+                                background: 'none',
+                                border: 'none',
+                                color: '#f59e0b',
+                                cursor: 'pointer',
+                                padding: '0.5rem',
+                                fontSize: '0.875rem',
+                                fontWeight: '600'
+                              }}
+                              onMouseEnter={(e) => e.target.style.background = 'rgba(245, 158, 11, 0.1)'}
+                              onMouseLeave={(e) => e.target.style.background = 'none'}
+                            >
+                              Forget
+                            </button>
                           </div>
                         )}
                       </div>
@@ -564,7 +632,7 @@ function Dashboard() {
             </table>
           </div>
         </div>
-    </div>
+      </div>
     </div>
   );
 }

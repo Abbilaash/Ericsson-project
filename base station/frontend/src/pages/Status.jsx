@@ -2,6 +2,8 @@ import { useMemo, useState } from 'react';
 import { useOverviewData } from '../hooks/useOverviewData';
 import './Dashboard.css';
 
+const API_BASE = 'http://localhost:5000';
+
 const getStatusColor = (battery, status) => {
   if (battery !== undefined && battery !== null && battery < 20) return '#ef4444';
   if (status && status.toUpperCase() === 'INSPECTING') return '#eab308';
@@ -10,95 +12,88 @@ const getStatusColor = (battery, status) => {
 
 function Status() {
   const { drones, robots, loading, error } = useOverviewData();
-  const [openMenuId, setOpenMenuId] = useState(null);
+  const [forgettingDeviceId, setForgettingDeviceId] = useState(null);
+  const [resettingTasks, setResettingTasks] = useState(false);
 
-  const handleEngage = (deviceId) => {
-    console.log(`Engaging device: ${deviceId}`);
-    setOpenMenuId(null);
+  const handleForgetDevice = async (deviceId) => {
+    const confirmed = window.confirm(`Forget device ${deviceId}?`);
+    if (!confirmed) {
+      return;
+    }
+
+    setForgettingDeviceId(deviceId);
+    try {
+      const response = await fetch(`${API_BASE}/api/forget-device`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: deviceId }),
+      });
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        alert(`Error: ${data.error || 'Failed to forget device'}`);
+        return;
+      }
+    } catch (err) {
+      console.error('Failed to forget device:', err);
+      alert('Failed to forget device');
+    } finally {
+      setForgettingDeviceId(null);
+    }
   };
 
-  const handleDisengage = (deviceId) => {
-    console.log(`Disengaging device: ${deviceId}`);
-    setOpenMenuId(null);
-  };
+  const handleResetTasks = async () => {
+    const confirmed = window.confirm('Reset task-completed list and task tracking?');
+    if (!confirmed) {
+      return;
+    }
 
-  const ActionMenu = ({ deviceId, taskId }) => (
-    <div style={{ position: 'relative', display: 'inline-block' }}>
-      <button
-        onClick={() => setOpenMenuId(openMenuId === deviceId ? null : deviceId)}
-        style={{
-          background: 'none',
-          border: 'none',
-          fontSize: '20px',
-          cursor: 'pointer',
-          padding: '0 8px',
-        }}
-      >
-        ⋮
-      </button>
-      {openMenuId === deviceId && (
-        <div
-          style={{
-            position: 'absolute',
-            top: '30px',
-            right: '0',
-            backgroundColor: '#fff',
-            border: '1px solid #ccc',
-            borderRadius: '4px',
-            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
-            zIndex: 1000,
-            minWidth: '120px',
-          }}
-        >
-          <button
-            onClick={() => handleEngage(deviceId)}
-            style={{
-              display: 'block',
-              width: '100%',
-              padding: '8px 12px',
-              border: 'none',
-              background: 'transparent',
-              textAlign: 'left',
-              cursor: 'pointer',
-              fontSize: '14px',
-              color: '#22c55e',
-              fontWeight: '500',
-            }}
-            onMouseEnter={(e) => (e.target.style.backgroundColor = '#f0f0f0')}
-            onMouseLeave={(e) => (e.target.style.backgroundColor = 'transparent')}
-          >
-            ENGAGE
-          </button>
-          <button
-            onClick={() => handleDisengage(deviceId)}
-            style={{
-              display: 'block',
-              width: '100%',
-              padding: '8px 12px',
-              border: 'none',
-              background: 'transparent',
-              textAlign: 'left',
-              cursor: 'pointer',
-              fontSize: '14px',
-              borderTop: '1px solid #eee',
-              color: '#ef4444',
-              fontWeight: '500',
-            }}
-            onMouseEnter={(e) => (e.target.style.backgroundColor = '#f0f0f0')}
-            onMouseLeave={(e) => (e.target.style.backgroundColor = 'transparent')}
-          >
-            DISENGAGE
-          </button>
-        </div>
-      )}
-    </div>
-  );
+    setResettingTasks(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/reset-tasks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        alert(`Error: ${data.error || 'Failed to reset tasks'}`);
+        return;
+      }
+
+      alert('Task tracking reset successfully. Same task can be assigned again.');
+    } catch (err) {
+      console.error('Failed to reset tasks:', err);
+      alert('Failed to reset tasks');
+    } finally {
+      setResettingTasks(false);
+    }
+  };
 
   const droneRows = useMemo(() => drones, [drones]);
   const robotRows = useMemo(() => robots, [robots]);
 
   return (
     <div className="dashboard">
+      <div style={{ padding: '1rem 1.5rem 0 1.5rem' }}>
+        <button
+          onClick={handleResetTasks}
+          disabled={resettingTasks}
+          style={{
+            background: 'rgba(14, 116, 144, 0.2)',
+            border: '1px solid rgba(56, 189, 248, 0.45)',
+            color: '#67e8f9',
+            fontWeight: '700',
+            letterSpacing: '0.02em',
+            cursor: resettingTasks ? 'not-allowed' : 'pointer',
+            borderRadius: '8px',
+            padding: '0.5rem 0.9rem',
+            opacity: resettingTasks ? 0.6 : 1,
+          }}
+        >
+          {resettingTasks ? 'RESETTING TASKS...' : 'RESET TASK'}
+        </button>
+      </div>
       <div className="top-section">
         <div className="panel drone-panel">
           <h2>Drone Status</h2>
@@ -122,7 +117,22 @@ function Status() {
                     <td>{drone.battery !== undefined && drone.battery !== null ? drone.battery : 'N/A'}%</td>
                     <td>{drone.task_id || 'None'}</td>
                     <td style={{ textAlign: 'center' }}>
-                      <ActionMenu deviceId={drone.id} taskId={drone.task_id} />
+                      <button
+                        onClick={() => handleForgetDevice(drone.id)}
+                        disabled={forgettingDeviceId === drone.id}
+                        style={{
+                          background: 'rgba(245, 158, 11, 0.15)',
+                          border: '1px solid rgba(245, 158, 11, 0.45)',
+                          color: '#fbbf24',
+                          fontWeight: '600',
+                          cursor: forgettingDeviceId === drone.id ? 'not-allowed' : 'pointer',
+                          borderRadius: '6px',
+                          padding: '0.35rem 0.7rem',
+                          opacity: forgettingDeviceId === drone.id ? 0.6 : 1,
+                        }}
+                      >
+                        {forgettingDeviceId === drone.id ? 'FORGETTING...' : 'FORGET'}
+                      </button>
                     </td>
                   </tr>
                 ))}
@@ -155,7 +165,22 @@ function Status() {
                     <td>{robot.battery !== undefined && robot.battery !== null ? robot.battery : 'N/A'}%</td>
                     <td>{robot.task_id || 'None'}</td>
                     <td style={{ textAlign: 'center' }}>
-                      <ActionMenu deviceId={robot.id} taskId={robot.task_id} />
+                      <button
+                        onClick={() => handleForgetDevice(robot.id)}
+                        disabled={forgettingDeviceId === robot.id}
+                        style={{
+                          background: 'rgba(245, 158, 11, 0.15)',
+                          border: '1px solid rgba(245, 158, 11, 0.45)',
+                          color: '#fbbf24',
+                          fontWeight: '600',
+                          cursor: forgettingDeviceId === robot.id ? 'not-allowed' : 'pointer',
+                          borderRadius: '6px',
+                          padding: '0.35rem 0.7rem',
+                          opacity: forgettingDeviceId === robot.id ? 0.6 : 1,
+                        }}
+                      >
+                        {forgettingDeviceId === robot.id ? 'FORGETTING...' : 'FORGET'}
+                      </button>
                     </td>
                   </tr>
                 ))}

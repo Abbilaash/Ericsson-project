@@ -8,7 +8,7 @@ import math
 import numpy as np
 import cv2
 import requests
-from picamera2 import Picamera2
+import platform
 
 
 UDP_SERVER_PORT = 8888 
@@ -28,7 +28,7 @@ QR_CODE_TO_ISSUE = {
 }
 
 # API Base URL for fetching QR data (adjust as needed)
-API_BASE_URL = "http://192.168.226.132:5000/api"
+API_BASE_URL = "http://192.168.161.132:5000/api"
 
 # Lookup table to resolve short QR payloads (like "1") to full API URLs
 # You can update these endpoints to match your backend routes.
@@ -432,29 +432,46 @@ def receive_messages(stop_event: threading.Event) -> None:
 
 
 def start_video_detection(stop_event: threading.Event, base_station_ip: str = None) -> None:
-	"""Detect and decode QR codes using PiCamera2 and OpenCV"""
-	picam2 = None
+	"""Detect and decode QR codes using OpenCV (works on Windows, Mac, Linux with default camera)"""
+	cap = None
 	sent_issues = set()  # Track which issues have already been sent to base station
 	try:
-		# Setup the Camera
-		logging.info("[VIDEO] Initializing PiCamera2 for QR code detection...")
-		picam2 = Picamera2()
-		config = picam2.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
-		picam2.configure(config)
-		picam2.start()
+		# Setup the Camera - use default camera (index 0)
+		logging.info("[VIDEO] Initializing default camera for QR code detection...")
+		cap = cv2.VideoCapture(0)
+		
+		if not cap.isOpened():
+			logging.error("[VIDEO] ✗ Failed to open camera. Check if camera is connected and not in use.")
+			return
+		
+		# Set camera properties for better performance
+		cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+		cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+		cap.set(cv2.CAP_PROP_FPS, 30)
 		
 		# Initialize OpenCV QR Code Detector
 		detector = cv2.QRCodeDetector()
 		
 		# Wait for camera to stabilize
 		time.sleep(2)
-		logging.info("[VIDEO] Camera initialized, starting QR code detection")
+		logging.info(f"[VIDEO] ✓ Camera initialized on {platform.system()}, starting QR code detection")
 		
+		frame_count = 0
 		while not stop_event.is_set():
 			try:
-				frame = picam2.capture_array()
+				ret, frame = cap.read()
+				
+				if not ret:
+					logging.warning("[VIDEO] Failed to read frame from camera")
+					break
+				
+				# Resize for faster processing
 				small_frame = cv2.resize(frame, (320, 240))
-				gray = cv2.cvtColor(small_frame, cv2.COLOR_RGB2GRAY)
+				
+				# Convert BGR to GRAY (OpenCV uses BGR format)
+				gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+				
+				# Detect and decode QR code
 				qr_data, bbox, _ = detector.detectAndDecode(gray)
 				
 				# If QR data is found, treat it as an API URL to fetch issue data
@@ -472,6 +489,12 @@ def start_video_detection(stop_event: threading.Event, base_station_ip: str = No
 						else:
 							logging.debug(f"[VIDEO] API {qr_data} did not return issue_type; not storing")
 				
+				frame_count += 1
+				
+				# Log status every 100 frames (roughly every 3 seconds at 30fps)
+				if frame_count % 100 == 0:
+					logging.debug(f"[VIDEO] Processing frames... (frame {frame_count})")
+				
 				# Small delay to prevent CPU spinning
 				time.sleep(0.01)
 				
@@ -484,10 +507,10 @@ def start_video_detection(stop_event: threading.Event, base_station_ip: str = No
 	except Exception as e:
 		logging.error(f"[VIDEO] Error in video detection: {e}")
 	finally:
-		if picam2:
+		if cap:
 			try:
-				picam2.stop()
-				logging.info("[VIDEO] Camera closed")
+				cap.release()
+				logging.info("[VIDEO] ✓ Camera closed")
 			except:
 				pass
 

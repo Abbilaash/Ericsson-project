@@ -1001,6 +1001,65 @@ def api_connections():
         "timestamp": time.time()
     })
 
+
+@app.route("/api/forget-device", methods=["POST"])
+def api_forget_device():
+    """Forget/remove a device from base station in-memory registry."""
+    data = request.get_json(silent=True) or {}
+    device_id = data.get("device_id")
+    device_ip = data.get("device_ip")
+
+    if not device_id and not device_ip:
+        return jsonify({"success": False, "error": "device_id or device_ip required"}), 400
+
+    removed_entries = []
+
+    with devices_lock:
+        if device_id and device_id in devices:
+            dev = devices.pop(device_id)
+            removed_entries.append((device_id, dev.get("ip")))
+        else:
+            # Support forgetting by normalized ID shown in frontend or by IP.
+            target_ids = []
+            for dev_id, dev in devices.items():
+                ip = dev.get("ip")
+                dtype = str(dev.get("device_type", "")).lower()
+                norm_id = f"DRONE_{ip.replace('.', '')}" if (dtype == "drone" and ip) else dev_id
+                if (device_id and norm_id == device_id) or (device_ip and ip == device_ip):
+                    target_ids.append(dev_id)
+
+            for target_id in target_ids:
+                dev = devices.pop(target_id, None)
+                if dev:
+                    removed_entries.append((target_id, dev.get("ip")))
+
+    if not removed_entries:
+        return jsonify({"success": False, "error": "Device not found"}), 404
+
+    # Clean up related tracking maps for forgotten devices.
+    removed_ids = {entry[0] for entry in removed_entries}
+    removed_ips = {entry[1] for entry in removed_entries if entry[1]}
+
+    with clients_lock:
+        for ip in removed_ips:
+            connected_clients.pop(ip, None)
+
+    with assignments_lock:
+        for issue_key, assigned_list in list(issue_assignments.items()):
+            filtered = [rid for rid in assigned_list if rid not in removed_ids]
+            if filtered:
+                issue_assignments[issue_key] = filtered
+            else:
+                issue_assignments.pop(issue_key, None)
+
+    print(f"[FORGET] Removed devices: {removed_entries}")
+    return jsonify({
+        "success": True,
+        "removed": [{"device_id": rid, "device_ip": rip} for rid, rip in removed_entries],
+        "count": len(removed_entries),
+        "timestamp": time.time(),
+    })
+
 @app.route("/api/overview",methods=["GET"])
 def api_overview():
     """Provide drones, robots, and tasks in a shape the frontend expects."""
@@ -1065,6 +1124,54 @@ def api_clear_logs():
     with logs_lock:
         network_logs.clear()
     return jsonify({"success": True, "message": "logs cleared"})
+
+
+@app.route("/api/reset-tasks", methods=["POST"])
+def api_reset_tasks():
+    """Reset completed/pending task state so the same issue can be reassigned again."""
+    global current_active_issue
+
+    with issues_lock:
+        detected_count = len(detected_issues)
+        progress_count = len(issue_progress)
+        detected_issues.clear()
+        issue_progress.clear()
+
+    with assignments_lock:
+        assignment_count = len(issue_assignments)
+        issue_assignments.clear()
+
+    with pending_lock:
+        pending_count = len(pending_issues)
+        pending_issues.clear()
+
+    with active_issue_lock:
+        current_active_issue = None
+
+    with devices_lock:
+        for dev in devices.values():
+            if str(dev.get("device_type", "")).lower() == "robot":
+                dev["task_id"] = None
+                dev["current_task"] = None
+                if dev.get("status") == "BUSY":
+                    dev["status"] = "READY"
+
+    print(
+        f"[RESET] Cleared tasks: detected={detected_count}, progress={progress_count}, "
+        f"assignments={assignment_count}, pending={pending_count}"
+    )
+
+    return jsonify({
+        "success": True,
+        "message": "Task tracking reset successfully",
+        "cleared": {
+            "detected_issues": detected_count,
+            "issue_progress": progress_count,
+            "issue_assignments": assignment_count,
+            "pending_issues": pending_count,
+        },
+        "timestamp": time.time(),
+    })
 
 
 @app.route("/api/current-issues", methods=["GET"])
